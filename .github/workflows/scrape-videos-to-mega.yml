@@ -1,0 +1,181 @@
+name: Scrape videos → edit shorts → upload to Mega.nz
+
+on:
+  workflow_dispatch:
+    inputs:
+      page_url:
+        description: |
+          One or more listing page URLs to scrape.
+          Put each URL on its own line, OR separate them with commas.
+        required: true
+        type: string
+      mega_folder_name:
+        description: "Mega.nz folder path to save the SHORT optimized clips into"
+        required: true
+        type: string
+      item_selector:
+        description: |
+          CSS selector for each video card/item on the listing page.
+          Examples: .item-post   |   div.video-card   |   #results .clip   |   article.post
+        required: false
+        default: ".item-post"
+        type: string
+      pagination_selector:
+        description: |
+          Optional CSS selector for Next / Load-more control. Leave blank if none.
+          Examples: a.next   |   .pagination a[rel=next]   |   button.load-more   |   .pager .next a
+        required: false
+        default: ""
+        type: string
+      video_href_contains:
+        description: |
+          Only keep links whose href contains this substring (default /videos/).
+          Leave blank to keep any link inside the item.
+        required: false
+        default: "/videos/"
+        type: string
+      max_idle_scrolls:
+        description: "Stop after this many scrolls with no NEW content (then try pagination if set)"
+        required: false
+        default: "8"
+        type: string
+      max_videos:
+        description: |
+          Target number of NEW unique videos (not already on Mega).
+          Keeps scrolling/paginating until this many NEW ones are found, or content ends.
+          Leave blank = no limit (scrape until exhausted).
+        required: false
+        default: ""
+        type: string
+      clip_seconds:
+        description: "Length of each short part produced by video_auto_editor (default 60)"
+        required: false
+        default: "60"
+        type: string
+      spreadsheet_id:
+        description: "(optional) Google Sheet ID to log File Name + Caption into"
+        required: false
+        default: "15_9D1UMPIYkq3vgeLxf4WdIxIrl_S_Oo_BmkIOpr7ng"
+        type: string
+      sheet_tab:
+        description: "(optional) Force a specific tab name — leave blank to use the Mega folder name"
+        required: false
+        default: ""
+        type: string
+      download_concurrency:
+        description: "How many full videos to download in parallel"
+        required: false
+        default: "4"
+        type: string
+      upload_transfers:
+        description: "How many files rclone uploads to Mega in parallel"
+        required: false
+        default: "4"
+        type: string
+      editor_extra_args:
+        description: |
+          Optional extra flags passed straight to video_auto_editor.py
+          (e.g. --no-optimize  or  --watermark none  or  --intro-sec 3)
+        required: false
+        default: ""
+        type: string
+      skip_edit:
+        description: "Set to 'true' to skip video_auto_editor and upload raw downloads (debug only)"
+        required: false
+        default: "false"
+        type: string
+
+jobs:
+  scrape-edit-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system packages (ffmpeg)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          echo "ffmpeg path: $(which ffmpeg)"
+          ffmpeg -version | head -3
+
+      - name: Install Python dependencies (scraper)
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+
+      - name: Install Python dependencies (video_auto_editor)
+        run: |
+          pip install opencv-python numpy imagehash pillow
+          python - <<'PY'
+          import numpy, cv2, imagehash
+          from PIL import Image
+          print("numpy", numpy.__version__)
+          print("cv2", cv2.__version__)
+          print("imagehash OK")
+          print("Pillow", Image.__version__)
+          print("All editor imports OK")
+          PY
+
+      - name: Install Playwright browsers
+        run: playwright install --with-deps chromium
+
+      - name: Install rclone
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+          rclone version
+
+      - name: Write rclone config file
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: printf '%s' "$RCLONE_CONF" > rclone.conf
+
+      - name: Write Google credentials file
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: printf '%s' "$GOOGLE_CREDENTIALS_JSON" > google_creds.json
+
+      - name: Run full pipeline (scrape → download → edit → upload shorts → sheet)
+        env:
+          PAGE_URL: ${{ inputs.page_url }}
+          MEGA_FOLDER_NAME: ${{ inputs.mega_folder_name }}
+          ITEM_SELECTOR: ${{ inputs.item_selector }}
+          PAGINATION_SELECTOR: ${{ inputs.pagination_selector }}
+          VIDEO_HREF_CONTAINS: ${{ inputs.video_href_contains }}
+          MAX_IDLE_SCROLLS: ${{ inputs.max_idle_scrolls }}
+          MAX_VIDEOS: ${{ inputs.max_videos }}
+          CLIP_SECONDS: ${{ inputs.clip_seconds }}
+          SPREADSHEET_ID: ${{ inputs.spreadsheet_id }}
+          SHEET_TAB: ${{ inputs.sheet_tab }}
+          DOWNLOAD_CONCURRENCY: ${{ inputs.download_concurrency }}
+          UPLOAD_TRANSFERS: ${{ inputs.upload_transfers }}
+          EDITOR_EXTRA_ARGS: ${{ inputs.editor_extra_args }}
+          SKIP_EDIT: ${{ inputs.skip_edit }}
+          RCLONE_CONFIG_PATH: rclone.conf
+          RCLONE_REMOTE_NAME: mega
+          GOOGLE_APPLICATION_CREDENTIALS: google_creds.json
+          PYTHONUNBUFFERED: "1"
+        run: python -u sitesdo_videos.py
+
+      - name: Clean up credentials files
+        if: always()
+        run: rm -f google_creds.json rclone.conf
+
+      - name: Upload leftover artifacts (debug aid)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-leftovers
+          path: |
+            downloaded_videos/
+            edited_videos/
+          if-no-files-found: ignore
