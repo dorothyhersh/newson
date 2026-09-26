@@ -1,0 +1,10 @@
+requests
+playwright
+google-api-python-client
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+opencv-python
+pillow
+imagehash
+pillow
