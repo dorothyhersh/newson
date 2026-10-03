@@ -21,6 +21,34 @@ Works on a single video OR a whole folder of videos in one command (batch mode
 is also what you want if many videos share the same intro/outro/logo, since it
 can detect those once instead of guessing per-file).
 
+v3 CHANGES (why some videos kept their watermark / got skipped)
+--------------------------------------------------------------------------
+Watermark detection (now fully per-video and adaptive):
+  * Sensitivity LADDER (strict -> lenient) instead of one fixed threshold.
+  * Usable window analysed as a whole AND in up to 4 time segments, merged --
+    catches credits/logos that only appear for part of the video.
+  * Every candidate is validated (edges persist inside the box, clearly
+    stronger than just outside it) so lenient rungs don't false-trigger.
+  * Canny thresholds adapt to each video's brightness.
+  * Removal padding is per-axis (long thin credit lines no longer balloon into
+    huge boxes that failed the area cap and were silently dropped).
+  * Strongly-persistent boxes get relaxed size/edge caps; weak ones stay strict.
+  * Batch: per-video detection ALWAYS runs first. If it finds nothing, the
+    position that recurs across the batch is used ONLY after being verified in
+    that video's own pixels (edges + temporal-median check for faint overlays).
+    --shared-watermark-from-first is now just a fallback source for that check.
+  * After rendering, the box is re-measured; if the overlay is still visible
+    the part is re-rendered with a 1.35x then 1.8x larger region.
+Skips fixed:
+  * Video discovery is case-insensitive and covers more formats (.MP4, .m4v, .ts...).
+  * a.mp4 and a.mov no longer overwrite each other.
+  * Short clips (< --two-part-min-sec) become one part instead of 0 parts.
+  * If intro/outro trimming leaves < 2s, the trims are ignored and the whole video is used.
+  * Detector crashes fall back to "no intro/outro/watermark" instead of killing the video.
+  * Per-region delogo failures drop only that region, not all watermark removal.
+  * Frame sampling falls back to ffmpeg when OpenCV seeking fails on odd files.
+  * End-of-run REPORT lists every video, parts written, watermark source, and the reason for anything skipped or not removed.
+
 --------------------------------------------------------------------------
 QUICK ANSWERS TO WHAT YOU ASKED
 --------------------------------------------------------------------------
@@ -264,6 +292,18 @@ DETECT_MAX_WIDTH = 960
 # --------------------------------------------------------------------------- #
 # Utility
 # --------------------------------------------------------------------------- #
+
+#: Per-video notes collected while processing (reasons for skips / fallbacks /
+#: undetected watermarks). Printed in the end-of-run report so nothing is
+#: skipped silently.
+CURRENT_NOTES: List[str] = []
+REPORT: List[dict] = []
+
+
+def _warn(msg: str) -> None:
+    print(f"  !! {msg}")
+    CURRENT_NOTES.append(msg)
+
 
 def run(cmd: List[str], timeout: Optional[float] = None) -> subprocess.CompletedProcess:
     # stdin=DEVNULL: ffmpeg otherwise inherits the CI runner's stdin and can
@@ -976,8 +1016,13 @@ class WatermarkBox:
     y: int
     w: int
     h: int
+    # Detector confidence (fraction of box pixels whose edges persist across
+    # sampled frames). 0.0 = unknown/manual. Used to relax the safety caps for
+    # strongly-persistent overlays instead of dropping them.
+    conf: float = 0.0
 
-    def clamped(self, frame_w: int, frame_h: int, pad: int = 4, margin: int = 4) -> "WatermarkBox":
+    def clamped(self, frame_w: int, frame_h: int, pad: int = 4, margin: int = 4,
+                pad_y: Optional[int] = None) -> "WatermarkBox":
         """Returns a padded copy of this box guaranteed to fit inside the frame
         WITH a safety margin on every side. ffmpeg's delogo filter samples
         pixels just outside the box to interpolate the fill, so a box that
@@ -1000,10 +1045,11 @@ class WatermarkBox:
         if x_max <= x_min or y_max <= y_min:
             return WatermarkBox(0, 0, 0, 0)  # frame itself too small for any margin
 
+        py = pad if pad_y is None else pad_y
         x1 = max(self.x - pad, x_min)
-        y1 = max(self.y - pad, y_min)
+        y1 = max(self.y - py, y_min)
         x2 = min(self.x + self.w + pad, x_max)
-        y2 = min(self.y + self.h + pad, y_max)
+        y2 = min(self.y + self.h + py, y_max)
 
         w = x2 - x1
         h = y2 - y1
@@ -1302,10 +1348,95 @@ def _merge_nearby_regions(boxes: List[Tuple[int, int, int, int]]) -> List[Tuple[
     return [tuple(c) for c in clusters]
 
 
-def detect_watermark_auto(path: str, start_sec: float, end_sec: float, sample_count: int = 48,
+def _read_gray_frames(path: str, start_sec: float, end_sec: float, count: int):
+    """Robustly sample `count` grayscale frames across [start_sec, end_sec].
+    Returns (frames_gray_at_detect_res, true_w, true_h, det_scale).
+
+    Primary path: OpenCV seek+read. Many scraped/VFR/HLS files make seeking
+    return nothing for some positions, which silently starved the detector of
+    frames (=> 'no watermark' on some videos only). If OpenCV yields fewer than
+    ~60% of the requested frames, the missing timestamps are pulled through
+    ffmpeg instead."""
+    frames: List[np.ndarray] = []
+    true_w = true_h = 0
+    det_scale = 1.0
+    times = np.linspace(start_sec, max(start_sec + 0.05, end_sec), num=count)
+
+    def _push(gray):
+        nonlocal true_w, true_h, det_scale
+        if not true_w:
+            true_h, true_w = gray.shape
+            if true_w > DETECT_MAX_WIDTH:
+                det_scale = true_w / float(DETECT_MAX_WIDTH)
+        if det_scale != 1.0:
+            gray = cv2.resize(gray, (int(round(true_w / det_scale)), int(round(true_h / det_scale))),
+                              interpolation=cv2.INTER_AREA)
+        frames.append(gray)
+
+    cap = cv2.VideoCapture(path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    missing = []
+    for t in times:
+        idx = int(t * fps)
+        if total_frames > 0:
+            idx = min(idx, total_frames - 1)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            missing.append(float(t))
+            continue
+        _push(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+    cap.release()
+
+    if len(frames) < 0.6 * count and missing:
+        w0, h0 = ffprobe_dimensions(path)
+        for t in missing:
+            try:
+                proc = subprocess.run(
+                    ["ffmpeg", "-nostdin", "-v", "error", "-ss", f"{t:.3f}", "-i", path, "-frames:v", "1",
+                     "-f", "image2pipe", "-vcodec", "png", "-"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, timeout=60)
+                if proc.returncode != 0 or not proc.stdout:
+                    continue
+                img = cv2.imdecode(np.frombuffer(proc.stdout, np.uint8), cv2.IMREAD_GRAYSCALE)
+                if img is None:
+                    continue
+                if true_w and img.shape[::-1] != (true_w, true_h):
+                    img = cv2.resize(img, (true_w, true_h), interpolation=cv2.INTER_AREA)
+                _push(img)
+            except Exception:   # noqa: BLE001
+                continue
+    return frames, true_w, true_h, det_scale
+
+
+def _box_persistence(edge_freq: np.ndarray, x: int, y: int, w: int, h: int) -> Tuple[float, float]:
+    """(static_frac, ring_ratio) for a box in detection coordinates.
+    static_frac : fraction of pixels in the box whose edge shows in >=40% of frames
+    ring_ratio  : mean edge frequency inside the box / mean just outside it.
+    A real burned-in overlay has persistent edges inside and clearly fewer
+    around it; moving picture content produces neither."""
+    H, W = edge_freq.shape
+    inner = edge_freq[y:y + h, x:x + w]
+    if inner.size == 0:
+        return 0.0, 0.0
+    static_frac = float((inner >= 0.4).mean())
+    pad = max(4, int(0.25 * max(w, h)))
+    x0, y0 = max(0, x - pad), max(0, y - pad)
+    x1, y1 = min(W, x + w + pad), min(H, y + h + pad)
+    outer = edge_freq[y0:y1, x0:x1]
+    ring_sum = float(outer.sum() - inner.sum())
+    ring_n = outer.size - inner.size
+    ring_mean = ring_sum / ring_n if ring_n > 0 else 0.0
+    return static_frac, float(inner.mean()) / (ring_mean + 1e-3)
+
+
+def _detect_wm_pass(path: str, start_sec: float, end_sec: float, sample_count: int = 48,
                            min_area_frac: float = 0.0004, max_area_frac: float = 0.45,
                            density_floor: float = 0.06, max_regions: int = 3,
-                           border_frac: float = 0.32, debug: bool = False
+                           border_frac: float = 0.32, debug: bool = False,
+                           peak_floor: float = 0.12, thresh_lo: float = 0.10,
+                           min_ring_ratio: float = 1.4, min_static_frac: float = 0.02
                            ) -> List[WatermarkBox]:
     """Finds every static logo, credit-text line, or larger burned-in caption
     block in the frame and returns a bounding box for EACH -- sized to
@@ -1356,39 +1487,22 @@ def detect_watermark_auto(path: str, start_sec: float, end_sec: float, sample_co
     already past the intro and before the outro) so a black-screen intro
     never gets sampled here.
     """
-    cap = cv2.VideoCapture(path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    start_frame = int(start_sec * fps)
-    end_frame = min(int(end_sec * fps), total_frames - 1)
-    end_frame = max(end_frame, start_frame + 1)
-
-    idxs = np.linspace(start_frame, end_frame, num=sample_count, dtype=int)
-
-    edge_accum = None
-    frames_gray = []
-    true_w = true_h = 0
-    det_scale = 1.0   # source px per detection px (>1 when frames are downscaled)
-    for idx in idxs:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
-        ok, frame = cap.read()
-        if not ok:
-            continue
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        if not true_w:
-            true_h, true_w = gray.shape
-            if true_w > DETECT_MAX_WIDTH:
-                det_scale = true_w / float(DETECT_MAX_WIDTH)
-        if det_scale != 1.0:
-            gray = cv2.resize(gray, (int(round(true_w / det_scale)), int(round(true_h / det_scale))),
-                              interpolation=cv2.INTER_AREA)
-        frames_gray.append(gray)
-        edges = cv2.Canny(gray, 60, 160)
-        edge_accum = edges.astype(np.float32) if edge_accum is None else edge_accum + edges.astype(np.float32)
-    cap.release()
-
-    if not frames_gray or edge_accum is None:
+    frames_gray, true_w, true_h, det_scale = _read_gray_frames(path, start_sec, end_sec, sample_count)
+    if len(frames_gray) < 6:
+        if debug:
+            print(f"  [watermark-detect] only {len(frames_gray)} frames could be read -- too few")
         return []
+
+    # Adaptive Canny: fixed 60/160 missed low-contrast overlays on dark/flat
+    # footage and over-fired on bright noisy footage. Derive thresholds from the
+    # median brightness of this video's own frames.
+    med = float(np.median(np.stack([f[::8, ::8] for f in frames_gray])))
+    c_lo = int(np.clip(0.66 * med, 25, 70))
+    c_hi = int(np.clip(c_lo * 2.4, 70, 180))
+    edge_accum = None
+    for g in frames_gray:
+        e = cv2.Canny(g, c_lo, c_hi).astype(np.float32)
+        edge_accum = e if edge_accum is None else edge_accum + e
 
     n = len(frames_gray)
     h_frame, w_frame = frames_gray[0].shape
@@ -1417,13 +1531,13 @@ def detect_watermark_auto(path: str, start_sec: float, end_sec: float, sample_co
               f"resolution={w_frame}x{h_frame}")
         print(f"  [watermark-detect] combined signal: peak={peak:.3f} mean={combined.mean():.4f}")
 
-    if peak < 0.12:
+    if peak < peak_floor:
         if debug:
-            print("  [watermark-detect] peak combined signal below floor (0.12) -- no watermark detected")
+            print(f"  [watermark-detect] peak combined signal below floor ({peak_floor}) -- no watermark detected")
         return []
 
     thresh = _otsu_threshold(combined)
-    thresh = float(np.clip(thresh, 0.10, peak * 0.65))
+    thresh = float(np.clip(thresh, thresh_lo, max(thresh_lo, peak * 0.65)))
     if debug:
         print(f"  [watermark-detect] adaptive (Otsu) threshold = {thresh:.3f}")
 
@@ -1559,6 +1673,16 @@ def detect_watermark_auto(path: str, start_sec: float, end_sec: float, sample_co
                 print(f"  [watermark-detect] region still covers {final_area_frac:.0%} of the frame after "
                       f"growth -- reverting to pre-growth box {(x, y, w, h)}")
             gx, gy, gw, gh = x, y, w, h
+        # Persistence validation (this is what makes the lenient passes safe):
+        # real overlays have edges that persist inside the box and are clearly
+        # stronger than just outside it.
+        static_frac, ring_ratio = _box_persistence(edge_freq, gx, gy, gw, gh)
+        if static_frac < min_static_frac or ring_ratio < min_ring_ratio:
+            if debug:
+                print(f"  [watermark-detect] rejected region {(gx, gy, gw, gh)}: static_frac={static_frac:.3f} "
+                      f"(<{min_static_frac}) or ring_ratio={ring_ratio:.2f} (<{min_ring_ratio}) -- "
+                      f"edges don't persist like a burned-in overlay")
+            continue
         if det_scale != 1.0:
             # Map the box from detection resolution back to the real frame.
             gx, gy, gw, gh = (int(round(v * det_scale)) for v in (gx, gy, gw, gh))
@@ -1566,6 +1690,7 @@ def detect_watermark_auto(path: str, start_sec: float, end_sec: float, sample_co
         else:
             box = WatermarkBox(gx, gy, gw, gh).clamped(w_frame, h_frame, pad=0)
         if box.w > 0 and box.h > 0:
+            box.conf = round(static_frac, 4)
             final_boxes.append(box)
 
     if debug:
@@ -1576,6 +1701,99 @@ def detect_watermark_auto(path: str, start_sec: float, end_sec: float, sample_co
             print("  [watermark-detect] no regions survived to the end")
 
     return final_boxes
+
+
+#: Sensitivity ladder: (peak_floor, otsu_floor, density_floor, min_ring_ratio).
+#: Strict first (fewest false positives); each later rung is more sensitive but
+#: demands stronger proof (ring_ratio) that the edges really are a static overlay.
+WM_LADDER = [
+    (0.12, 0.10, 0.06, 1.4),
+    (0.08, 0.07, 0.05, 1.6),
+    (0.05, 0.045, 0.04, 2.0),
+]
+
+
+def detect_watermark_auto(path: str, start_sec: float, end_sec: float, sample_count: int = 48,
+                           min_area_frac: float = 0.0004, max_area_frac: float = 0.45,
+                           density_floor: float = 0.06, max_regions: int = 4,
+                           border_frac: float = 0.32, debug: bool = False
+                           ) -> List[WatermarkBox]:
+    """Dynamic watermark/logo/credit-text detection.
+
+    Why the old single pass was inconsistent, and what this does instead:
+      * One fixed sensitivity -> faint or semi-transparent overlays fell under
+        the peak floor on some videos only. Now: a SENSITIVITY LADDER (strict ->
+        lenient). It stops at the first rung that finds a validated overlay, so
+        clean videos aren't over-triggered but faint ones still get caught.
+      * One window over the whole video -> an overlay visible only part of the
+        time (credit that appears for 10s, logo that moves between scenes) was
+        diluted below threshold. Now: the usable window is ALSO split into up to
+        4 segments, each analysed on its own, and the results are merged.
+      * Every candidate is validated (edges persist inside the box and are much
+        stronger than just outside it), which is what makes lenient rungs safe.
+    """
+    usable = max(0.0, end_sec - start_sec)
+    if usable <= 0:
+        return []
+    nseg = int(np.clip(usable // 12, 1, 4))
+    windows = [(start_sec, end_sec, max(sample_count, 40))]
+    if nseg > 1:
+        seg_len = usable / nseg
+        for i in range(nseg):
+            windows.append((start_sec + i * seg_len, start_sec + (i + 1) * seg_len, 28))
+
+    for rung, (pk, tlo, dens, ring) in enumerate(WM_LADDER):
+        found: List[WatermarkBox] = []
+        for (ws, we, cnt) in windows:
+            try:
+                found += _detect_wm_pass(path, ws, we, sample_count=cnt, min_area_frac=min_area_frac,
+                                         max_area_frac=max_area_frac, density_floor=min(density_floor, dens),
+                                         max_regions=max_regions, border_frac=border_frac, debug=debug,
+                                         peak_floor=pk, thresh_lo=tlo, min_ring_ratio=ring)
+            except Exception as e:   # noqa: BLE001 - one bad window must not lose the others
+                if debug:
+                    print(f"  [watermark-detect] window [{ws:.1f},{we:.1f}] failed: {e}")
+        if found:
+            if debug:
+                print(f"  [watermark-detect] ladder rung {rung + 1}/{len(WM_LADDER)} produced "
+                      f"{len(found)} raw region(s) across {len(windows)} window(s)")
+            return _merge_window_boxes(found, max_regions)
+        if debug:
+            print(f"  [watermark-detect] ladder rung {rung + 1}/{len(WM_LADDER)} found nothing -- "
+                  f"trying a more sensitive rung" if rung + 1 < len(WM_LADDER) else
+                  "  [watermark-detect] lenient rung found nothing -- no watermark detected")
+    return []
+
+
+def _merge_window_boxes(boxes: List[WatermarkBox], max_regions: int) -> List[WatermarkBox]:
+    """Union boxes from different windows/segments that overlap or nearly touch
+    (the same overlay seen in several segments, or a logo whose extent differs
+    slightly between segments) so one overlay becomes ONE removal box."""
+    items = [[b.x, b.y, b.w, b.h, b.conf] for b in boxes]
+    changed = True
+    while changed:
+        changed = False
+        out, used = [], [False] * len(items)
+        for i in range(len(items)):
+            if used[i]:
+                continue
+            cur = items[i]
+            for j in range(i + 1, len(items)):
+                if used[j]:
+                    continue
+                gap = max(4, int(0.15 * min(max(cur[2], cur[3]), max(items[j][2], items[j][3]))))
+                if _boxes_overlap_or_close(tuple(cur[:4]), tuple(items[j][:4]), gap):
+                    x1, y1 = min(cur[0], items[j][0]), min(cur[1], items[j][1])
+                    x2 = max(cur[0] + cur[2], items[j][0] + items[j][2])
+                    y2 = max(cur[1] + cur[3], items[j][1] + items[j][3])
+                    cur = [x1, y1, x2 - x1, y2 - y1, max(cur[4], items[j][4])]
+                    used[j] = True
+                    changed = True
+            out.append(cur)
+            used[i] = True
+        items = out
+    items.sort(key=lambda t: t[4], reverse=True)
+    return [WatermarkBox(a, b, c, d, conf=e) for a, b, c, d, e in items[:max_regions]]
 
 
 def detect_watermark_manual(path: str) -> Optional[WatermarkBox]:
@@ -1711,11 +1929,19 @@ def compute_parts(usable_start: float, usable_end: float, clip_sec: float,
 # Rendering
 # --------------------------------------------------------------------------- #
 
-def _removal_pad(wm: "WatermarkBox") -> int:
-    """Extra px around a detected box so soft/antialiased edges are covered.
-    v2: 8% (was 12%) with a 4px floor -- every extra pixel is more smeared
-    picture, and the detector already grows boxes to their real extent."""
-    return max(4, int(round(0.08 * max(wm.w, wm.h))))
+def _removal_pad(wm: "WatermarkBox") -> Tuple[int, int]:
+    """(pad_x, pad_y) in px around a detected box so soft/antialiased edges are
+    covered. PER-AXIS: the old single pad (8% of the LONGEST side on every edge)
+    made a long thin credit line balloon vertically into a huge box that then
+    failed the area cap -- which is why wide text credits were removed on some
+    videos and silently skipped on others."""
+    return max(4, int(round(0.05 * wm.w))), max(4, int(round(0.15 * wm.h)))
+
+
+def _padded(wm: "WatermarkBox", frame_w: int, frame_h: int, grow: float = 1.0) -> "WatermarkBox":
+    px, py = _removal_pad(wm)
+    base = _grow_box(wm, grow) if grow != 1.0 else wm
+    return base.clamped(frame_w, frame_h, pad=px, pad_y=py)
 
 
 def limit_watermark_boxes(wms: List["WatermarkBox"], frame_w: int, frame_h: int,
@@ -1733,25 +1959,36 @@ def limit_watermark_boxes(wms: List["WatermarkBox"], frame_w: int, frame_h: int,
     kept: List["WatermarkBox"] = []
     total = 0.0
     for wm in wms:
-        padded = wm.clamped(frame_w, frame_h, pad=_removal_pad(wm))
+        padded = _padded(wm, frame_w, frame_h)
         if padded.w <= 0 or padded.h <= 0:
             continue
         frac = (padded.w * padded.h) / frame_area
         cx, cy = wm.x + wm.w / 2.0, wm.y + wm.h / 2.0
         dist_edge = min(cx, cy, frame_w - cx, frame_h - cy)
-        desc = f"x={wm.x} y={wm.y} w={wm.w} h={wm.h} ({frac:.1%} of frame)"
-        if edge_only and dist_edge > edge_zone:
-            print(f"  !! Ignoring watermark candidate {desc}: it is in the middle of the picture, "
-                  f"not near an edge -- delogo there would blur real content. "
-                  f"(--watermark-allow-center to override)")
+        desc = f"x={wm.x} y={wm.y} w={wm.w} h={wm.h} ({frac:.1%} of frame, conf={wm.conf:.2f})"
+        # Confidence-aware limits: a box whose edges persist strongly (conf is the
+        # fraction of its pixels with persistent edges) is almost certainly a real
+        # overlay even if it's big or off-edge (centre text bars, tiled marks), so
+        # it gets double the area cap and the edge-proximity rule is waived. Weak
+        # boxes still face the strict caps. This replaces the old one-size-fits-all
+        # rejection that silently dropped real credit blocks on some videos.
+        strong = wm.conf >= 0.08
+        if strong:
+            max_region_frac_eff = max(max_region_frac * 2.0, 0.25)
+        else:
+            max_region_frac_eff = max_region_frac
+        if edge_only and not strong and dist_edge > edge_zone:
+            _warn(f"Ignoring watermark candidate {desc}: it is in the middle of the picture, "
+                  f"not near an edge and not strongly persistent -- delogo there would blur real "
+                  f"content. (--watermark-allow-center to override)")
             continue
-        if frac > max_region_frac:
-            print(f"  !! Ignoring watermark candidate {desc}: larger than the "
-                  f"{max_region_frac:.0%} per-region cap -- delogo would leave a big blurry patch. "
+        if frac > max_region_frac_eff:
+            _warn(f"Ignoring watermark candidate {desc}: larger than the "
+                  f"{max_region_frac_eff:.0%} per-region cap -- delogo would leave a big blurry patch. "
                   f"(raise --watermark-max-area-pct, or pass --watermark-box for a manual box)")
             continue
-        if total + frac > max_total_frac:
-            print(f"  !! Ignoring watermark candidate {desc}: total delogo area would exceed "
+        if total + frac > (max(max_total_frac * 1.5, 0.28) if strong else max_total_frac):
+            _warn(f"Ignoring watermark candidate {desc}: total delogo area would exceed "
                   f"{max_total_frac:.0%} of the frame. (--watermark-total-area-pct)")
             continue
         kept.append(wm)
@@ -1813,61 +2050,224 @@ def _validate_output(path: str, expected_sec: float) -> None:
         raise RuntimeError(f"output too short ({dur:.1f}s, expected ~{expected_sec:.1f}s): {path}")
 
 
+def _grow_box(wm: "WatermarkBox", factor: float) -> "WatermarkBox":
+    if factor == 1.0:
+        return wm
+    nw, nh = int(round(wm.w * factor)), int(round(wm.h * factor))
+    return WatermarkBox(wm.x - (nw - wm.w) // 2, wm.y - (nh - wm.h) // 2, nw, nh, conf=wm.conf)
+
+
 def render_clip(input_path: str, output_path: str, start_sec: float, clip_sec: float,
                  watermarks: List[WatermarkBox], crf: Optional[int] = None,
                  preset: Optional[str] = None,
                  optimize: bool = True, max_dim: int = MAX_DIM,
                  video_bitrate: str = VIDEO_BITRATE, audio_bitrate: str = AUDIO_BITRATE,
-                 encode_preset: str = DEFAULT_ENCODE_PRESET):
+                 encode_preset: str = DEFAULT_ENCODE_PRESET, grow: float = 1.0) -> bool:
+    """Renders one part. Returns True if every requested watermark region was
+    actually delogo'd, False if any had to be dropped (reason goes in the report).
+
+    Fallback ladder (never silently skips the part):
+      1. all regions together
+      2. each region probed on its own; keep only the ones ffmpeg accepts
+      3. no delogo at all
+      4. plain safe encode (veryfast, no filters except even-size scale)"""
     frame_w, frame_h = ffprobe_dimensions(input_path)
     if crf is None:
         crf = VIDEO_CRF if optimize else 18
     enc_preset = preset or encode_preset
 
-    delogo_filters: List[str] = []
+    boxes: List[str] = []
     for watermark in watermarks or []:
-        safe_box = watermark.clamped(frame_w, frame_h, pad=_removal_pad(watermark))
+        safe_box = _padded(watermark, frame_w, frame_h, grow)
         if safe_box.w > 0 and safe_box.h > 0:
-            delogo_filters.append(safe_box.as_ffmpeg_delogo())
+            boxes.append(safe_box.as_ffmpeg_delogo())
         else:
-            print("  !! A watermark region was invalid after clamping to frame bounds -- "
+            _warn("A watermark region was invalid after clamping to frame bounds -- "
                   "skipping delogo for that region on this render.")
+    all_applied = len(boxes) == len(watermarks or [])
 
     # delogo runs at SOURCE resolution (before the downscale) so the smeared
     # area is as small as possible in the final picture.
     scale_filters = _scale_filters(frame_w, frame_h, optimize, max_dim)
-    attempts = [delogo_filters + scale_filters]
-    if delogo_filters:
-        attempts.append(scale_filters)   # last resort: keep the video, skip delogo
-
     timeout = max(600, int(clip_sec * 40))
-    last_err: Optional[Exception] = None
-    for n, flt in enumerate(attempts):
+
+    def _try(flt: List[str], preset_: str) -> Optional[Exception]:
         cmd = _build_render_cmd(input_path, output_path, start_sec, clip_sec, flt, optimize,
-                                crf, enc_preset, video_bitrate, audio_bitrate)
+                                crf, preset_, video_bitrate, audio_bitrate)
         try:
             run(cmd, timeout=timeout)
             _validate_output(output_path, clip_sec)
-            if n > 0:
-                print("  !! Rendered WITHOUT delogo (the delogo render failed). "
-                      "The watermark may still be visible in this clip.")
-            return
-        except Exception as e:   # noqa: BLE001 - we retry / re-raise below
-            last_err = e
+            return None
+        except Exception as e:   # noqa: BLE001
             try:
                 if os.path.exists(output_path):
                     os.remove(output_path)     # never leave a half-written file behind
             except OSError:
                 pass
-            if n + 1 < len(attempts):
-                tail = str(e).strip().splitlines()[-1][:300] if str(e).strip() else ""
-                print(f"  !! Render with delogo failed ({tail}) -- retrying once without delogo.")
-    raise last_err  # type: ignore[misc]
+            return e
+
+    last_err: Optional[Exception] = None
+    if boxes:
+        last_err = _try(boxes + scale_filters, enc_preset)
+        if last_err is None:
+            return all_applied
+        if len(boxes) > 1:
+            # probe each region alone on a 1s clip, keep the ones that work
+            good = []
+            for b in boxes:
+                probe_out = output_path + ".probe.mp4"
+                cmd = _build_render_cmd(input_path, probe_out, start_sec, min(1.0, clip_sec),
+                                        [b] + scale_filters, optimize, 30, "ultrafast",
+                                        video_bitrate, audio_bitrate)
+                try:
+                    run(cmd, timeout=120)
+                    good.append(b)
+                except Exception:   # noqa: BLE001
+                    pass
+                finally:
+                    if os.path.exists(probe_out):
+                        os.remove(probe_out)
+            if good and len(good) < len(boxes):
+                err = _try(good + scale_filters, enc_preset)
+                if err is None:
+                    _warn(f"{len(boxes) - len(good)} watermark region(s) rejected by ffmpeg; "
+                          f"removed the other {len(good)}.")
+                    return False
+                last_err = err
+        _warn("delogo render failed -- rendering this part WITHOUT watermark removal.")
+        err = _try(scale_filters, enc_preset)
+        if err is None:
+            return False
+        last_err = err
+
+    else:
+        last_err = _try(scale_filters, enc_preset)
+        if last_err is None:
+            return all_applied
+
+    _warn("normal render failed -- trying a plain safe encode.")
+    err = _try(scale_filters, "veryfast")
+    if err is None:
+        return False
+    raise err if err else last_err  # type: ignore[misc]
+
+
+def _residual_static_fraction(video_path: str, wm: "WatermarkBox", src_w: int, src_h: int,
+                              samples: int = 12) -> float:
+    """After rendering, re-measure how many pixels inside the (source-space) box
+    still carry persistent edges in the OUTPUT. A removed overlay leaves ~0; a
+    surviving one (box too small/misaligned) leaves a clearly visible fraction."""
+    frames, tw, th, _scale = _read_gray_frames(video_path, 0.5, max(1.0, ffprobe_duration(video_path) - 0.5), samples)
+    if len(frames) < 4:
+        return 0.0
+    H, W = frames[0].shape
+    med = float(np.median(np.stack([f[::8, ::8] for f in frames])))
+    c_lo = int(np.clip(0.66 * med, 25, 70))
+    c_hi = int(np.clip(c_lo * 2.4, 70, 180))
+    acc = sum(cv2.Canny(f, c_lo, c_hi).astype(np.float32) for f in frames) / (255.0 * len(frames))
+    sx, sy = W / float(src_w), H / float(src_h)
+    x, y = int(wm.x * sx), int(wm.y * sy)
+    w, h = max(2, int(wm.w * sx)), max(2, int(wm.h * sy))
+    inner = acc[y:y + h, x:x + w]
+    return float((inner >= 0.4).mean()) if inner.size else 0.0
 
 
 # --------------------------------------------------------------------------- #
 # Pipeline for one video
 # --------------------------------------------------------------------------- #
+
+def _median_hp_ratio(med_img: np.ndarray, x: int, y: int, w: int, h: int) -> Tuple[float, float]:
+    """(inner_energy, inner/ring ratio) of the high-passed temporal-median image."""
+    H, W = med_img.shape
+    hp = np.abs(med_img - cv2.GaussianBlur(med_img, (0, 0), 3))
+    inner_sum = float(hp[y:y + h, x:x + w].sum())
+    inner = inner_sum / max(1, w * h)
+    pad = max(6, int(0.5 * max(w, h)))
+    outer = hp[max(0, y - pad):min(H, y + h + pad), max(0, x - pad):min(W, x + w + pad)]
+    n_ring = outer.size - w * h
+    ring = (float(outer.sum()) - inner_sum) / n_ring if n_ring > 0 else 0.0
+    return inner, inner / (ring + 1e-3)
+
+
+def verify_boxes_on_video(path: str, wms: List[WatermarkBox], start_sec: float, end_sec: float
+                          ) -> List[WatermarkBox]:
+    """Checks that candidate boxes (e.g. a batch-consensus position, given as
+    fractions and rescaled to this video) really contain a persistent static
+    overlay in THIS video before delogo is allowed to smear them. Looser
+    thresholds than detection because the location is already known."""
+    if not wms:
+        return []
+    frames, tw, th, scale = _read_gray_frames(path, start_sec, max(start_sec + 0.5, end_sec), 28)
+    if len(frames) < 6:
+        return []
+    med = float(np.median(np.stack([f[::8, ::8] for f in frames])))
+    c_lo = int(np.clip(0.66 * med, 25, 70))
+    c_hi = int(np.clip(c_lo * 2.4, 70, 180))
+    acc = sum(cv2.Canny(f, c_lo, c_hi).astype(np.float32) for f in frames) / (255.0 * len(frames))
+    H, W = acc.shape
+    med_img = np.median(np.stack(frames), axis=0).astype(np.float32)
+    ok_boxes = []
+    for b in wms:
+        x, y = int(b.x / scale), int(b.y / scale)
+        w, h = max(2, int(b.w / scale)), max(2, int(b.h / scale))
+        x, y = max(0, min(x, W - 2)), max(0, min(y, H - 2))
+        w, h = min(w, W - x), min(h, H - y)
+        static_frac, ring_ratio = _box_persistence(acc, x, y, w, h)
+        if static_frac >= 0.008 and ring_ratio >= 1.25:
+            b.conf = round(static_frac, 4)
+            ok_boxes.append(b)
+            continue
+        # Second signal for FAINT / semi-transparent overlays whose edges are too
+        # weak for Canny: over time the moving picture averages out in the
+        # temporal MEDIAN, while a constant overlay survives in it. So the median
+        # image's high-pass energy inside the box vs just around it exposes it.
+        hp_inner, hp_ratio = _median_hp_ratio(med_img, x, y, w, h)
+        if hp_inner >= 2.0 and hp_ratio >= 1.35:
+            b.conf = max(b.conf, 0.08)
+            ok_boxes.append(b)
+    return ok_boxes
+
+
+def consensus_boxes(fraction_sets: List[List[Tuple[float, float, float, float]]],
+                    min_votes: int = 2, min_share: float = 0.3
+                    ) -> List[Tuple[float, float, float, float]]:
+    """Given per-video detected boxes (as fractions of the frame), find the
+    positions that recur across videos. Used as a VERIFIED fallback for videos
+    where per-video detection found nothing (faint/short overlay) even though
+    the rest of the batch shares the same watermark."""
+    flat = [(i, f) for i, fs in enumerate(fraction_sets) for f in fs]
+    if not flat:
+        return []
+
+    def iou(a, b):
+        ax2, ay2, bx2, by2 = a[0] + a[2], a[1] + a[3], b[0] + b[2], b[1] + b[3]
+        iw = max(0.0, min(ax2, bx2) - max(a[0], b[0]))
+        ih = max(0.0, min(ay2, by2) - max(a[1], b[1]))
+        inter = iw * ih
+        union = a[2] * a[3] + b[2] * b[3] - inter
+        return inter / union if union > 0 else 0.0
+
+    clusters: List[List[Tuple[int, Tuple[float, float, float, float]]]] = []
+    for item in flat:
+        for c in clusters:
+            if iou(item[1], c[0][1]) > 0.35:
+                c.append(item)
+                break
+        else:
+            clusters.append([item])
+    n_with = sum(1 for fs in fraction_sets if fs)
+    need = max(min_votes, int(np.ceil(min_share * n_with)))
+    out = []
+    for c in clusters:
+        voters = {i for i, _ in c}
+        if len(voters) >= need:
+            xs = [f[0] for _, f in c]; ys = [f[1] for _, f in c]
+            x2 = [f[0] + f[2] for _, f in c]; y2 = [f[1] + f[3] for _, f in c]
+            # median edges -> robust union-ish box
+            x0, y0 = float(np.median(xs)), float(np.median(ys))
+            out.append((x0, y0, float(np.median(x2)) - x0, float(np.median(y2)) - y0))
+    return out
+
 
 def process_single(path: str, out_path_template: str, clip_sec: float, watermark_mode: str,
                     dry_run: bool, single_clip: bool, keep_remainder: bool,
@@ -1891,72 +2291,92 @@ def process_single(path: str, out_path_template: str, clip_sec: float, watermark
                     encode_preset: str = DEFAULT_ENCODE_PRESET,
                     crf: Optional[int] = None,
                     wm_total_frac: float = 0.10,
-                    wm_edge_only: bool = True) -> int:
-    """Returns the number of output files written."""
+                    wm_edge_only: bool = True,
+                    plan_only: bool = False,
+                    consensus_pcts: Optional[List[Tuple[float, float, float, float]]] = None):
+    """Plans (and, unless plan_only, renders) one video.
+    Returns the number of output files written, or the plan dict if plan_only."""
+    CURRENT_NOTES.clear()
     duration = ffprobe_duration(path)
     print(f"[{os.path.basename(path)}]")
 
-    # --- intro ---
-    if intro_override is not None:
-        intro = BoundaryResult(intro_override, "manual_override", "high")
-    elif shared_intro_end is not None:
-        intro = BoundaryResult(shared_intro_end, "batch_common_prefix", "high")
-    else:
-        intro = detect_intro_single(path, max_search_sec=intro_max_search, debug=debug_detect)
+    # --- intro --- (a detector crash must never skip the video: fall back to "no intro")
+    try:
+        if intro_override is not None:
+            intro = BoundaryResult(intro_override, "manual_override", "high")
+        elif shared_intro_end is not None:
+            intro = BoundaryResult(shared_intro_end, "batch_common_prefix", "high")
+        else:
+            intro = detect_intro_single(path, max_search_sec=intro_max_search, debug=debug_detect)
+    except Exception as e:   # noqa: BLE001
+        _warn(f"intro detection crashed ({str(e).strip()[-120:]}); assuming no intro")
+        intro = BoundaryResult(0.0, "detect_error", "none")
     if intro.time_sec > duration - 5:
         intro = BoundaryResult(0.0, intro.method + "_rejected_too_long", "none")
 
     # --- outro ---
-    # NOTE: the safety margin is only applied to DETECTED boundaries (plain
-    # detection or the shared-batch-length case) -- an explicit
-    # --outro-sec/--outro-override is taken at face value since the user
-    # already told us exactly where to cut.
-    if outro_override is not None:
-        outro_start = outro_override
-        outro_method, outro_conf = "manual_override", "high"
-    elif shared_outro_len is not None:
-        outro_start = duration - shared_outro_len
-        outro_method, outro_conf = "batch_common_suffix", "high"
-    else:
-        outro = detect_outro_single(path, max_search_sec=outro_max_search,
-                                     safety_margin=outro_safety_margin, debug=debug_detect)
-        outro_start, outro_method, outro_conf = outro.time_sec, outro.method, outro.confidence
+    # NOTE: the safety margin is only applied to DETECTED boundaries.
+    try:
+        if outro_override is not None:
+            outro_start = outro_override
+            outro_method, outro_conf = "manual_override", "high"
+        elif shared_outro_len is not None:
+            outro_start = duration - shared_outro_len
+            outro_method, outro_conf = "batch_common_suffix", "high"
+        else:
+            outro = detect_outro_single(path, max_search_sec=outro_max_search,
+                                         safety_margin=outro_safety_margin, debug=debug_detect)
+            outro_start, outro_method, outro_conf = outro.time_sec, outro.method, outro.confidence
+    except Exception as e:   # noqa: BLE001
+        _warn(f"outro detection crashed ({str(e).strip()[-120:]}); assuming no outro")
+        outro_start, outro_method, outro_conf = duration, "detect_error", "none"
     if outro_start < intro.time_sec + 5:
         outro_start, outro_method, outro_conf = duration, outro_method + "_rejected_too_short", "none"
 
-    # --no-outro-detect / --outro-sec pass 10**9 or an out-of-range value. Without
-    # this clamp the usable window became ~1e9 seconds and the splitter tried to
-    # plan ~16 million 60s parts (hang + disk fill).
+    # --no-outro-detect / --outro-sec pass 10**9 or an out-of-range value; clamp.
     outro_start = min(outro_start, duration)
     usable_start, usable_end = intro.time_sec, outro_start
 
-    # --- watermark / credit text (may be MULTIPLE separate regions: a
-    # caption block and a separate logo mark, for example) ---
+    # --- watermark / credit text (may be MULTIPLE separate regions) ---
     frame_w, frame_h = ffprobe_dimensions(path)
+    wm_notes = ""
     if watermark_box_spec is not None:
         wms = [watermark_from_pixels(watermark_box_spec)]
         wm_source = "manual_pixels"
     elif watermark_box_pct_spec is not None:
         wms = [watermark_from_pct(watermark_box_pct_spec, frame_w, frame_h)]
         wm_source = "manual_pct"
-    elif shared_watermark_pcts is not None:
-        # Rescaled from FRACTIONS of the first video's frame, not raw pixel
-        # coordinates -- this is what makes --shared-watermark-from-first
-        # work correctly across a batch with mixed resolutions instead of
-        # reusing pixel coordinates that fall off-frame on smaller videos.
-        wms = [watermark_box_from_fractions(xp, yp, wp, hp, frame_w, frame_h)
-               for (xp, yp, wp, hp) in shared_watermark_pcts]
-        wm_source = "shared_from_first_scaled"
     elif watermark_mode == "auto":
-        # start_sec=usable_start ensures we only ever sample AFTER the intro
-        # (i.e. never inside a black-screen intro) when looking for the logo.
-        wms = detect_watermark_auto(path, start_sec=usable_start, end_sec=usable_end,
-                                     max_area_frac=watermark_max_area_frac, debug=debug_detect)
+        # Per-video detection ALWAYS runs first (segments x sensitivity ladder).
+        # A box copied from another video is only a fallback, and only used after
+        # it has been VERIFIED against this video's own pixels -- blindly reusing
+        # the first video's box is what removed the watermark on some videos and
+        # smeared clean picture (or missed a moved logo) on others.
+        try:
+            wms = detect_watermark_auto(path, start_sec=usable_start, end_sec=usable_end,
+                                         max_area_frac=watermark_max_area_frac, debug=debug_detect)
+        except Exception as e:   # noqa: BLE001
+            _warn(f"watermark detection crashed ({str(e).strip()[-120:]})")
+            wms = []
         wm_source = "auto_detect"
-        if not wms:
-            print("  !! No watermark auto-detected. Run with --debug-detect --debug-preview to see "
-                  "candidate scoring, or skip detection entirely with --watermark-box x,y,w,h / "
-                  "--watermark-box-pct x,y,w,h.")
+        if wms:
+            wms = limit_watermark_boxes(wms, frame_w, frame_h,
+                                        max_region_frac=watermark_max_area_frac,
+                                        max_total_frac=wm_total_frac, edge_only=wm_edge_only)
+        fallback_pcts = consensus_pcts if consensus_pcts is not None else shared_watermark_pcts
+        if not wms and fallback_pcts:
+            cand = [watermark_box_from_fractions(xp, yp, wp, hp, frame_w, frame_h)
+                    for (xp, yp, wp, hp) in fallback_pcts]
+            wms = verify_boxes_on_video(path, cand, usable_start, usable_end)
+            if wms:
+                wm_source = "batch_consensus_verified"
+                wm_notes = "own detection found nothing; used verified batch-consensus position"
+            else:
+                wm_notes = "no watermark detected and the batch-consensus position is not present in this video"
+        if not wms and not wm_notes:
+            wm_notes = "no watermark detected (faint/absent?). Try --debug-detect --debug-preview or --watermark-box-pct"
+        if wm_notes:
+            _warn(wm_notes) if not wms else print(f"  note: {wm_notes}")
     elif watermark_mode == "manual":
         manual_box = detect_watermark_manual(path)
         wms = [manual_box] if manual_box is not None else []
@@ -1964,13 +2384,6 @@ def process_single(path: str, out_path_template: str, clip_sec: float, watermark
     else:
         wms = []
         wm_source = "none"
-
-    # Safety net for anything the detector produced (manual boxes are trusted).
-    if wms and wm_source in ("auto_detect", "shared_from_first_scaled"):
-        wms = limit_watermark_boxes(wms, frame_w, frame_h,
-                                    max_region_frac=watermark_max_area_frac,
-                                    max_total_frac=wm_total_frac,
-                                    edge_only=wm_edge_only)
 
     # --- parts ---
     if single_clip:
@@ -1980,12 +2393,27 @@ def process_single(path: str, out_path_template: str, clip_sec: float, watermark
                                two_part_fallback=two_part_fallback,
                                two_part_min_sec=two_part_min_sec)
 
+    # Never silently produce nothing: ladder of fallbacks before giving up.
+    if (not parts or parts[0][1] < 2.0) and duration >= 2.0:
+        usable = max(0.0, usable_end - usable_start)
+        if usable >= 2.0:
+            parts = [(usable_start, min(usable, clip_sec) if single_clip else usable)]
+            _warn(f"usable window is only {usable:.1f}s -- kept as one short part instead of skipping")
+        else:
+            _warn(f"intro/outro trimming left {usable:.1f}s -- ignoring detected trims and using the whole video")
+            usable_start, usable_end = 0.0, duration
+            if single_clip:
+                parts = [(0.0, min(clip_sec, duration))]
+            else:
+                parts = compute_parts(0.0, duration, clip_sec, True, two_part_fallback=True,
+                                      two_part_min_sec=min(two_part_min_sec, 4.0)) or [(0.0, duration)]
+
     print(f"  duration         : {duration:.2f}s")
     print(f"  intro end        : {intro.time_sec:.2f}s  (method={intro.method}, confidence={intro.confidence})")
     print(f"  outro start      : {outro_start:.2f}s  (method={outro_method}, confidence={outro_conf})")
     print(f"  usable window    : {usable_start:.2f}s -> {usable_end:.2f}s  ({max(0.0, usable_end-usable_start):.2f}s usable)")
     if wms:
-        boxes_desc = "; ".join(f"x={b.x} y={b.y} w={b.w} h={b.h}" for b in wms)
+        boxes_desc = "; ".join(f"x={b.x} y={b.y} w={b.w} h={b.h} conf={b.conf:.2f}" for b in wms)
         print(f"  watermark region(s): {len(wms)} ({wm_source}) -- {boxes_desc}")
     else:
         print("  watermark region(s): none")
@@ -1997,32 +2425,45 @@ def process_single(path: str, out_path_template: str, clip_sec: float, watermark
     print(f"  parts to produce : {len(parts)}")
     for i, (pstart, pdur) in enumerate(parts, 1):
         print(f"    part {i:02d}: {pstart:.2f}s -> {pstart+pdur:.2f}s  ({pdur:.2f}s)")
-    if len(parts) == 0 and not single_clip:
-        usable = max(0.0, usable_end - usable_start)
-        if two_part_fallback:
-            print(f"  !! 0 parts: usable window ({usable:.2f}s) is shorter than --two-part-min-sec "
-                  f"({two_part_min_sec:.0f}s), so even the two-equal-part fallback was skipped. "
-                  f"Lower --two-part-min-sec if you still want output from this clip.")
-        else:
-            print(f"  !! 0 parts: usable window ({usable:.2f}s) is shorter than --clip-seconds ({clip_sec:.0f}s). "
-                  f"Pass --keep-remainder to keep it as one shorter part, lower --clip-seconds, "
-                  f"or drop --no-two-part-fallback to let it split into two equal parts automatically.")
 
     if debug_preview:
         base_dir = os.path.dirname(out_path_template) or "."
         base_name = os.path.splitext(os.path.basename(out_path_template))[0]
         os.makedirs(base_dir, exist_ok=True)
         preview_path = os.path.join(base_dir, f"{base_name}_wm_preview.png")
-        # Grab a frame from the MIDDLE of the usable window, not right after
-        # the intro -- a frame near usable_start can still look intro-ish
-        # (fade-in, title card, etc.) and isn't representative of where the
-        # watermark actually sits during normal content.
         preview_at = usable_start + (usable_end - usable_start) / 2.0
         preview_at = min(preview_at, max(0.0, usable_end - 0.5))
         save_watermark_preview(path, wms, preview_path, at_sec=preview_at)
 
-    if dry_run:
-        return 0
+    plan = dict(path=path, out_path_template=out_path_template, parts=parts, wms=wms, wm_source=wm_source,
+                frame_w=frame_w, frame_h=frame_h, crf=crf, optimize=optimize, max_dim=max_dim,
+                video_bitrate=video_bitrate, audio_bitrate=audio_bitrate, encode_preset=encode_preset,
+                notes=list(CURRENT_NOTES), dry_run=dry_run, duration=duration,
+                usable=(usable_start, usable_end))
+    if plan_only:
+        return plan
+    return execute_plan(plan)
+
+
+def execute_plan(plan: dict) -> int:
+    """Renders a plan from process_single. Verifies each rendered part: if a
+    watermark region still shows persistent edges afterwards (box too tight or
+    slightly misaligned) the part is re-rendered with a progressively larger
+    box (1.35x, then 1.8x), keeping the cleanest result."""
+    CURRENT_NOTES[:] = plan["notes"]
+    path, parts, wms = plan["path"], plan["parts"], plan["wms"]
+    out_path_template = plan["out_path_template"]
+    entry = dict(name=os.path.basename(path), parts_planned=len(parts), written=0,
+                 wm_source=plan["wm_source"], wm_regions=len(wms), notes=CURRENT_NOTES)
+
+    def _finish(n: int) -> int:
+        entry["written"] = n
+        entry["notes"] = list(CURRENT_NOTES)
+        REPORT.append(entry)
+        return n
+
+    if plan["dry_run"]:
+        return _finish(0)
 
     base_dir = os.path.dirname(out_path_template) or "."
     base_name = os.path.splitext(os.path.basename(out_path_template))[0]
@@ -2030,8 +2471,8 @@ def process_single(path: str, out_path_template: str, clip_sec: float, watermark
     os.makedirs(base_dir, exist_ok=True)
 
     if len(parts) == 0:
-        print("  !! No parts to render (usable window too short).")
-        return 0
+        _warn("No parts to render (video shorter than 2s or unreadable duration).")
+        return _finish(0)
 
     written = 0
     for i, (pstart, pdur) in enumerate(parts, 1):
@@ -2041,16 +2482,68 @@ def process_single(path: str, out_path_template: str, clip_sec: float, watermark
             out_path = os.path.join(base_dir, base_name + ext)
         else:
             out_path = os.path.join(base_dir, f"{base_name}_part{i:02d}{ext}")
+        kw = dict(crf=plan["crf"], optimize=plan["optimize"], max_dim=plan["max_dim"],
+                  video_bitrate=plan["video_bitrate"], audio_bitrate=plan["audio_bitrate"],
+                  encode_preset=plan["encode_preset"])
         try:
-            render_clip(path, out_path, pstart, pdur, wms, crf=crf,
-                        optimize=optimize, max_dim=max_dim, video_bitrate=video_bitrate,
-                        audio_bitrate=audio_bitrate, encode_preset=encode_preset)
+            applied = render_clip(path, out_path, pstart, pdur, wms, **kw)
+            if wms and applied:
+                resid = max(_residual_static_fraction(out_path, w, plan["frame_w"], plan["frame_h"]) for w in wms)
+                for grow in (1.35, 1.8):
+                    if resid < RESIDUAL_LIMIT:
+                        break
+                    tmp = out_path + ".retry.mp4"
+                    try:
+                        render_clip(path, tmp, pstart, pdur, wms, grow=grow, **kw)
+                        r2 = max(_residual_static_fraction(tmp, w, plan["frame_w"], plan["frame_h"]) for w in wms)
+                    except Exception:   # noqa: BLE001
+                        r2 = resid
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+                        break
+                    if r2 < resid:
+                        os.replace(tmp, out_path)
+                        _warn(f"part {i:02d}: watermark still visible after first pass "
+                              f"(residual {resid:.3f}); re-rendered with a {grow:.2f}x larger region "
+                              f"(residual now {r2:.3f}).")
+                        resid = r2
+                    else:
+                        os.remove(tmp)
+                if resid >= RESIDUAL_LIMIT:
+                    _warn(f"part {i:02d}: watermark may still be partly visible (residual {resid:.3f}). "
+                          f"Check with --debug-preview or give --watermark-box-pct.")
         except Exception as e:   # noqa: BLE001 - keep the other parts of this video
-            print(f"  !! part {i:02d} failed and was skipped: {str(e).strip()[-400:]}")
+            _warn(f"part {i:02d} failed and was skipped: {str(e).strip()[-400:]}")
             continue
         written += 1
         print(f"  -> wrote {out_path}")
-    return written
+    return _finish(written)
+
+
+#: A rendered part whose watermark box still has more than this fraction of
+#: persistent-edge pixels is considered "not cleanly removed".
+RESIDUAL_LIMIT = 0.05
+
+
+def print_report() -> None:
+    """End-of-run table: what happened to every video and WHY, so nothing is
+    skipped or left un-removed silently."""
+    if not REPORT:
+        return
+    print("\n" + "=" * 78)
+    print("REPORT (per video)")
+    print("=" * 78)
+    for e in REPORT:
+        status = "OK " if e["written"] > 0 else "NONE"
+        print(f"[{status}] {e['name']}: {e['written']}/{e['parts_planned']} part(s), "
+              f"watermark={e['wm_regions']} region(s) via {e['wm_source']}")
+        for n in e["notes"]:
+            print(f"        - {n}")
+    skipped = [e for e in REPORT if e["written"] == 0]
+    nowm = [e for e in REPORT if e["wm_regions"] == 0 and e["wm_source"] == "auto_detect"]
+    print("-" * 78)
+    print(f"{len(REPORT) - len(skipped)} produced output, {len(skipped)} produced none, "
+          f"{len(nowm)} had no watermark found.")
 
 
 # --------------------------------------------------------------------------- #
@@ -2175,6 +2668,7 @@ def main():
                         encode_preset=args.encode_preset, crf=args.crf,
                         wm_total_frac=args.watermark_total_area_pct / 100.0,
                         wm_edge_only=args.wm_edge_only)
+        print_report()
 
     else:  # batch
         if not args.batch:
@@ -2182,11 +2676,14 @@ def main():
         outdir = args.outdir or (args.batch.rstrip("/\\") + "_out")
         os.makedirs(outdir, exist_ok=True)
 
-        exts = ("*.mp4", "*.mov", "*.mkv", "*.avi", "*.webm")
-        paths = []
-        for e in exts:
-            paths.extend(glob.glob(os.path.join(args.batch, e)))
-        paths.sort()
+        # Case-insensitive and wider than before: the old glob("*.mp4") missed
+        # VIDEO.MP4, .m4v, .ts, .flv, .wmv, .mpg ... which looked like "videos
+        # being skipped" even though they were never even seen.
+        vid_exts = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".ts", ".flv", ".wmv",
+                    ".mpg", ".mpeg", ".3gp", ".mts", ".m2ts", ".ogv"}
+        paths = sorted(os.path.join(args.batch, f) for f in os.listdir(args.batch)
+                       if os.path.isfile(os.path.join(args.batch, f))
+                       and os.path.splitext(f)[1].lower() in vid_exts)
         if not paths:
             sys.exit(f"No videos found in {args.batch}")
         print(f"Found {len(paths)} videos.")
@@ -2197,6 +2694,8 @@ def main():
         readable = [p for p in paths if is_readable_video(p)]
         for bad in sorted(set(paths) - set(readable)):
             print(f"  !! Skipping unreadable/corrupt file: {os.path.basename(bad)}")
+            REPORT.append(dict(name=os.path.basename(bad), parts_planned=0, written=0, wm_source="n/a",
+                               wm_regions=0, notes=["unreadable/corrupt (ffprobe found no video stream or duration)"]))
         paths = readable
         if not paths:
             sys.exit("No readable videos in the batch.")
@@ -2239,48 +2738,31 @@ def main():
         # the shared_watermark_pcts branch in process_single) fixes that.
         # This may be MULTIPLE regions (e.g. a caption block plus a
         # separate logo mark) -- all of them get carried through together.
-        shared_wm_pcts = None
-        if args.watermark_box is None and args.watermark_box_pct is None:
-            if args.watermark == "auto" and args.shared_watermark_from_first:
-                probe_start = shared_intro_end or 0.0
-                probe_end = ffprobe_duration(paths[0]) - (shared_outro_len or 0.0)
-                shared_wms = detect_watermark_auto(paths[0], start_sec=probe_start, end_sec=probe_end,
-                                                    max_area_frac=args.watermark_max_area_pct / 100.0,
-                                                    debug=args.debug_detect)
-                if shared_wms:
-                    src_w, src_h = ffprobe_dimensions(paths[0])
-                    shared_wms = limit_watermark_boxes(shared_wms, src_w, src_h,
-                                                       max_region_frac=args.watermark_max_area_pct / 100.0,
-                                                       max_total_frac=args.watermark_total_area_pct / 100.0,
-                                                       edge_only=args.wm_edge_only)
-                if shared_wms:
-                    shared_wm_pcts = [wm.to_fractions(src_w, src_h) for wm in shared_wms]
-                    boxes_desc = "; ".join(f"x={wm.x} y={wm.y} w={wm.w} h={wm.h}" for wm in shared_wms)
-                    print(f"Shared watermark region(s) (from first video, {src_w}x{src_h}): "
-                          f"{len(shared_wms)} -- {boxes_desc} -- will be rescaled per video's own resolution.")
-                else:
-                    print("Shared watermark detection found nothing -- consider --watermark-box / "
-                          "--watermark-box-pct, or --debug-preview + --debug-detect to diagnose.")
-            elif args.watermark == "manual" and args.shared_watermark_from_first:
-                shared_wm = detect_watermark_manual(paths[0])
-                if shared_wm:
-                    src_w, src_h = ffprobe_dimensions(paths[0])
-                    shared_wm_pcts = [shared_wm.to_fractions(src_w, src_h)]
+        per_video_outro_override = None
+        if args.outro_sec is not None:
+            per_video_outro_override = args.outro_sec
+        elif args.no_outro_detect:
+            per_video_outro_override = 10**9
 
-        n_ok, n_failed = 0, 0
-        for p in paths:
+        import traceback
+        # Output names: never let a.mp4 and a.mov (or two nested names) overwrite each other.
+        used_bases = set()
+
+        def _out_template(p):
             base = os.path.splitext(os.path.basename(p))[0]
-            out_template = os.path.join(outdir, base + ".mp4")
-            per_video_outro_override = None
-            if args.outro_sec is not None:
-                per_video_outro_override = args.outro_sec
-            elif args.no_outro_detect:
-                per_video_outro_override = 10**9
+            if base.lower() in used_bases:
+                base = base + "_" + os.path.splitext(p)[1].lstrip(".").lower()
+            used_bases.add(base.lower())
+            return os.path.join(outdir, base + ".mp4")
 
+        # PHASE 1: plan every video (intro/outro/watermark/parts), nothing rendered yet.
+        plans = []
+        n_failed = 0
+        for p in paths:
             try:
-                written = process_single(p, out_template, args.clip_seconds, args.watermark,
+                plan = process_single(p, _out_template(p), args.clip_seconds, args.watermark,
                                 args.dry_run, args.single_clip, args.keep_remainder,
-                                shared_watermark_pcts=shared_wm_pcts,
+                                shared_watermark_pcts=None,
                                 shared_intro_end=shared_intro_end,
                                 shared_outro_len=shared_outro_len,
                                 intro_override=None if shared_intro_end is not None else args.intro_sec,
@@ -2298,25 +2780,68 @@ def main():
                                 video_bitrate=args.video_bitrate, audio_bitrate=args.audio_bitrate,
                                 encode_preset=args.encode_preset, crf=args.crf,
                                 wm_total_frac=args.watermark_total_area_pct / 100.0,
-                                wm_edge_only=args.wm_edge_only)
+                                wm_edge_only=args.wm_edge_only, plan_only=True)
+                plans.append(plan)
+            except Exception as e:   # noqa: BLE001 - one bad file must not stop the batch
+                print(f"  !! ERROR planning {os.path.basename(p)} -- skipping this video and "
+                      f"continuing with the rest of the batch.")
+                traceback.print_exc()
+                print()
+                REPORT.append(dict(name=os.path.basename(p), parts_planned=0, written=0, wm_source="n/a",
+                                   wm_regions=0, notes=[f"crashed while planning: {str(e).strip()[-200:]}"]))
+                n_failed += 1
+
+        # PHASE 1b: batch-consensus watermark. Videos where per-video detection found
+        # nothing get the position that recurs across the batch -- but only if it is
+        # VERIFIED to exist in that video's own pixels (no blind copy-paste).
+        auto_mode = (args.watermark == "auto" and args.watermark_box is None
+                     and args.watermark_box_pct is None)
+        if auto_mode and len(plans) >= 2:
+            frac_sets = [[w.to_fractions(pl["frame_w"], pl["frame_h"]) for w in pl["wms"]]
+                         for pl in plans if pl["wm_source"] == "auto_detect"]
+            cons = consensus_boxes(frac_sets)
+            if not cons and args.shared_watermark_from_first:
+                first = next((fs for fs in frac_sets if fs), None)
+                cons = first or []
+            if cons:
+                print(f"\nBatch-consensus watermark position(s) (fractions x,y,w,h): "
+                      f"{[tuple(round(v, 3) for v in c) for c in cons]}")
+                for pl in plans:
+                    if pl["wm_source"] == "auto_detect" and not pl["wms"]:
+                        cand = [watermark_box_from_fractions(xp, yp, wp, hp, pl["frame_w"], pl["frame_h"])
+                                for (xp, yp, wp, hp) in cons]
+                        ok = verify_boxes_on_video(pl["path"], cand, *pl["usable"])
+                        name = os.path.basename(pl["path"])
+                        if ok:
+                            pl["wms"] = ok
+                            pl["wm_source"] = "batch_consensus_verified"
+                            pl["notes"].append("own detection found nothing; used verified batch-consensus position")
+                            print(f"  {name}: applied verified consensus watermark region(s).")
+                        else:
+                            pl["notes"].append("no watermark detected and the batch-consensus position "
+                                               "is not present in this video")
+            else:
+                print("\nNo recurring watermark position found across the batch.")
+
+        # PHASE 2: render.
+        n_ok = 0
+        for pl in plans:
+            try:
+                written = execute_plan(pl)
                 if written or args.dry_run:
                     n_ok += 1
                 else:
                     n_failed += 1
-            except Exception:
-                # Don't let one bad file (corrupt frame, ffmpeg edge case,
-                # weird resolution, etc.) kill the whole batch -- print the
-                # full traceback for that video so it can be debugged, then
-                # move on to the rest.
-                import traceback
-                print(f"  !! ERROR processing {os.path.basename(p)} -- skipping this video and "
-                      f"continuing with the rest of the batch.")
+            except Exception as e:   # noqa: BLE001
+                print(f"  !! ERROR rendering {os.path.basename(pl['path'])} -- continuing with the batch.")
                 traceback.print_exc()
-                print()
+                REPORT.append(dict(name=os.path.basename(pl["path"]), parts_planned=len(pl["parts"]), written=0,
+                                   wm_source=pl["wm_source"], wm_regions=len(pl["wms"]),
+                                   notes=[f"crashed while rendering: {str(e).strip()[-200:]}"]))
                 n_failed += 1
-                continue
 
         print(f"\nBatch summary: {n_ok} video(s) produced output, {n_failed} produced none.")
+        print_report()
         if n_ok == 0 and n_failed > 0 and not args.dry_run:
             sys.exit(1)
 
