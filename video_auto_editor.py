@@ -49,6 +49,31 @@ Skips fixed:
   * Frame sampling falls back to ffmpeg when OpenCV seeking fails on odd files.
   * End-of-run REPORT lists every video, parts written, watermark source, and the reason for anything skipped or not removed.
 
+v4 CHANGES (retries; bigger removal area)
+--------------------------------------------------------------------------
+  * Intro/outro detection now RETRIES up to 3x per video: each attempt scans a longer
+    window (x1.7, x2.5) with a more sensitive scene-cut threshold (0.35 -> 0.28 -> 0.22).
+    Outro retries also look at a bigger share of the video and add a little more safety margin.
+  * After each first/last part is rendered it is re-checked; any leftover black/colour
+    bumper/fade at the start or end is trimmed and the part re-rendered.
+  * Watermark/logo/credit detection RETRIES with a progressively WIDER search area
+    (edge band 0.32 -> 0.45 -> 0.60 of the frame, smaller minimum mark, larger maximum
+    block) x 4 sensitivity levels (one extra very-faint level added).
+  * Removal box is slightly bigger by default (padding 8% of width / 25% of height),
+    and if the overlay is still visible after rendering, re-rendered at 1.35x, 1.8x, 2.4x.
+  * The REPORT shows which retry succeeded and anything still not removed.
+
+v5 CHANGES (GitHub Actions / sitesdo_videos.py pipeline)
+--------------------------------------------------------------------------
+  * --report-json PATH : machine-readable per-video report (clips, intro/outro cut, watermark boxes,
+    "still visible" / "not found" flags, notes). sitesdo_videos.py turns it into the job summary.
+  * --time-budget-min N : soft limit; no new video is started after N minutes, the rest are reported
+    as "deferred" (the pipeline retries them next run) so the job never times out with nothing uploaded.
+  * --max-retry-renders N : caps extra re-renders per video (bigger delogo box / extra trim).
+  * Watermark detection decodes its frames once and shares them across all segments/retries (fast on long videos).
+  * Retry results for intro/outro can never trim more than 25% of the video (max 60s), and a scan window
+    that is "static" from its very first sample is no longer mistaken for an end card.
+
 --------------------------------------------------------------------------
 QUICK ANSWERS TO WHAT YOU ASKED
 --------------------------------------------------------------------------
@@ -255,6 +280,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -593,7 +619,7 @@ def _static_opening_boundary(stats, stable_frames: int = 3, stable_thresh: float
 
 
 def detect_intro_single(path: str, max_search_sec: float = DEFAULT_INTRO_MIN_SCAN_SEC,
-                         debug: bool = False) -> BoundaryResult:
+                         debug: bool = False, cut_thresh: float = 0.35) -> BoundaryResult:
     duration = ffprobe_duration(path)
     # Always scan out to at least `max_search_sec` (default 15s) as long as
     # the video is actually that long; only fall back to a smaller window
@@ -692,7 +718,7 @@ def detect_intro_single(path: str, max_search_sec: float = DEFAULT_INTRO_MIN_SCA
               f"{[(round(t, 2), round(s, 3)) for t, s in top5]}")
     if cuts:
         best_t, best_score = max(cuts, key=lambda x: x[1])
-        if best_score > 0.35:
+        if best_score > cut_thresh:
             if debug:
                 print(f"  [intro-detect] -> using scene cut at {best_t:.2f}s (score={best_score:.3f})")
             return BoundaryResult(round(best_t, 2), "scene_cut", "medium")
@@ -828,7 +854,8 @@ DEFAULT_OUTRO_MAX_SEARCH_SEC = DEFAULT_OUTRO_MIN_SCAN_SEC
 
 def detect_outro_single(path: str, max_search_sec: float = DEFAULT_OUTRO_MAX_SEARCH_SEC,
                          safety_margin: float = DEFAULT_OUTRO_SAFETY_MARGIN_SEC,
-                         debug: bool = False) -> BoundaryResult:
+                         debug: bool = False, cut_thresh: float = 0.35,
+                         window_frac: float = 0.4) -> BoundaryResult:
     """Scans the LAST portion of the video for the EARLIEST boundary any of
     several outro patterns find -- a hard black-frame gap, a solid-color end
     card, a static/near-motionless end card or CTA overlay, or a gradual
@@ -844,7 +871,7 @@ def detect_outro_single(path: str, max_search_sec: float = DEFAULT_OUTRO_MAX_SEA
     instead of leaving a few of those transition frames in the usable part.
     """
     duration = ffprobe_duration(path)
-    window = min(max_search_sec, duration * 0.4)
+    window = min(max_search_sec, duration * window_frac)
     start_offset = max(0.0, duration - window)
     stats = _sample_frame_stats(path, window, start_offset=start_offset)
     if debug:
@@ -874,6 +901,13 @@ def detect_outro_single(path: str, max_search_sec: float = DEFAULT_OUTRO_MAX_SEA
     #    finishes on (catches detailed graphics and semi-transparent
     #    overlays that neither of the above two checks would flag).
     static_t = _static_ending_boundary(stats, debug=debug)
+    if static_t is not None and static_t <= stats[0][0] + 0.3:
+        # The WHOLE scanned window looks the same: no transition into an end card was
+        # seen, so this is slow / low-motion footage, not an outro. Trusting it used to
+        # chop 40% off such videos.
+        if debug:
+            print("  [outro-detect] entire scan window is 'static' -- no card start found, ignoring")
+        static_t = None
     if static_t is not None:
         candidates.append(BoundaryResult(round(static_t, 2), "static_card_outro", "high"))
 
@@ -900,7 +934,7 @@ def detect_outro_single(path: str, max_search_sec: float = DEFAULT_OUTRO_MAX_SEA
 
     # 5. Fallback -- the strongest hard scene change anywhere in the window.
     cuts = _strongest_cuts(stats)
-    strong_cuts = [c for c in cuts if c[1] > 0.35]
+    strong_cuts = [c for c in cuts if c[1] > cut_thresh]
     if debug and cuts:
         top5 = sorted(cuts, key=lambda x: -x[1])[:5]
         print(f"  [outro-detect] top scene-cut candidates (time, score, need >0.35): "
@@ -919,6 +953,71 @@ def detect_outro_single(path: str, max_search_sec: float = DEFAULT_OUTRO_MAX_SEA
         print("  [outro-detect] no black run, color/static end-card, brightness fade, or strong scene "
               "cut found -- no boundary (outro start = end of video, i.e. nothing trimmed)")
     return BoundaryResult(duration, "no_clear_boundary", "none")
+
+
+# Retry ladders: each attempt widens the scan window and relaxes the scene-cut
+# threshold a little. The first attempt that returns a real boundary wins; if
+# every attempt finds nothing the video simply isn't trimmed (and the report says so).
+INTRO_RETRIES = [  # (window multiplier, scene-cut threshold)
+    (1.0, 0.35), (1.7, 0.28), (2.5, 0.22),
+]
+OUTRO_RETRIES = [  # (window multiplier, scene-cut threshold, window_frac of video, extra safety margin)
+    (1.0, 0.35, 0.40, 0.0), (1.7, 0.28, 0.50, 0.5), (2.5, 0.22, 0.60, 1.0),
+]
+
+
+def detect_intro_with_retries(path: str, max_search_sec: float = DEFAULT_INTRO_MIN_SCAN_SEC,
+                              debug: bool = False) -> BoundaryResult:
+    last = BoundaryResult(0.0, "no_clear_boundary", "none")
+    for n, (mult, cut) in enumerate(INTRO_RETRIES, 1):
+        try:
+            r = detect_intro_single(path, max_search_sec=max_search_sec * mult, debug=debug, cut_thresh=cut)
+        except Exception as e:   # noqa: BLE001
+            if debug:
+                print(f"  [intro-detect] attempt {n} crashed: {e}")
+            continue
+        if r.confidence != "none" and r.time_sec > 0.0:
+            # Retries are looser, so they get a sanity cap: never trim more than a quarter of
+            # the video (or 60s) on a retry result -- better to keep a bit of intro than cut footage.
+            if n > 1 and r.time_sec > min(0.25 * ffprobe_duration(path), 60.0):
+                if debug:
+                    print(f"  [intro-detect] retry {n} result {r.time_sec:.1f}s exceeds the sanity cap -- ignored")
+                last = r
+                continue
+            if n > 1:
+                print(f"  intro found on retry {n}/{len(INTRO_RETRIES)} (window x{mult}, cut>{cut}): "
+                      f"{r.time_sec:.2f}s via {r.method}")
+            return r
+        last = r
+    return last
+
+
+def detect_outro_with_retries(path: str, max_search_sec: float = DEFAULT_OUTRO_MAX_SEARCH_SEC,
+                              safety_margin: float = DEFAULT_OUTRO_SAFETY_MARGIN_SEC,
+                              debug: bool = False) -> BoundaryResult:
+    duration = ffprobe_duration(path)
+    last = BoundaryResult(duration, "no_clear_boundary", "none")
+    for n, (mult, cut, frac, extra) in enumerate(OUTRO_RETRIES, 1):
+        try:
+            r = detect_outro_single(path, max_search_sec=max_search_sec * mult,
+                                    safety_margin=safety_margin + extra, debug=debug,
+                                    cut_thresh=cut, window_frac=frac)
+        except Exception as e:   # noqa: BLE001
+            if debug:
+                print(f"  [outro-detect] attempt {n} crashed: {e}")
+            continue
+        if r.confidence != "none" and r.time_sec < duration - 0.3:
+            if n > 1 and (duration - r.time_sec) > min(0.25 * duration, 60.0):
+                if debug:
+                    print(f"  [outro-detect] retry {n} would trim {duration - r.time_sec:.1f}s (sanity cap) -- ignored")
+                last = r
+                continue
+            if n > 1:
+                print(f"  outro found on retry {n}/{len(OUTRO_RETRIES)} (window x{mult}, cut>{cut}): "
+                      f"starts {r.time_sec:.2f}s via {r.method}")
+            return r
+        last = r
+    return last
 
 
 # --------------------------------------------------------------------------- #
@@ -1348,7 +1447,21 @@ def _merge_nearby_regions(boxes: List[Tuple[int, int, int, int]]) -> List[Tuple[
     return [tuple(c) for c in clusters]
 
 
+_FRAME_CACHE: dict = {}
+
+
 def _read_gray_frames(path: str, start_sec: float, end_sec: float, count: int):
+    """Cached wrapper: retries re-analyse the same frames with different
+    settings, so they are decoded once per (video, window, count)."""
+    key = (path, round(start_sec, 2), round(end_sec, 2), count)
+    if key not in _FRAME_CACHE:
+        if len(_FRAME_CACHE) > 12:
+            _FRAME_CACHE.clear()
+        _FRAME_CACHE[key] = _read_gray_frames_uncached(path, start_sec, end_sec, count)
+    return _FRAME_CACHE[key]
+
+
+def _read_gray_frames_uncached(path: str, start_sec: float, end_sec: float, count: int):
     """Robustly sample `count` grayscale frames across [start_sec, end_sec].
     Returns (frames_gray_at_detect_res, true_w, true_h, det_scale).
 
@@ -1436,7 +1549,8 @@ def _detect_wm_pass(path: str, start_sec: float, end_sec: float, sample_count: i
                            density_floor: float = 0.06, max_regions: int = 3,
                            border_frac: float = 0.32, debug: bool = False,
                            peak_floor: float = 0.12, thresh_lo: float = 0.10,
-                           min_ring_ratio: float = 1.4, min_static_frac: float = 0.02
+                           min_ring_ratio: float = 1.4, min_static_frac: float = 0.02,
+                           preloaded=None
                            ) -> List[WatermarkBox]:
     """Finds every static logo, credit-text line, or larger burned-in caption
     block in the frame and returns a bounding box for EACH -- sized to
@@ -1487,7 +1601,10 @@ def _detect_wm_pass(path: str, start_sec: float, end_sec: float, sample_count: i
     already past the intro and before the outro) so a black-screen intro
     never gets sampled here.
     """
-    frames_gray, true_w, true_h, det_scale = _read_gray_frames(path, start_sec, end_sec, sample_count)
+    if preloaded is not None:
+        frames_gray, true_w, true_h, det_scale = preloaded
+    else:
+        frames_gray, true_w, true_h, det_scale = _read_gray_frames(path, start_sec, end_sec, sample_count)
     if len(frames_gray) < 6:
         if debug:
             print(f"  [watermark-detect] only {len(frames_gray)} frames could be read -- too few")
@@ -1710,6 +1827,16 @@ WM_LADDER = [
     (0.12, 0.10, 0.06, 1.4),
     (0.08, 0.07, 0.05, 1.6),
     (0.05, 0.045, 0.04, 2.0),
+    (0.035, 0.03, 0.03, 2.4),   # very faint; needs strong proof it is a static overlay
+]
+#: Search-area widening retries: (border_frac, min_area_frac multiplier, max_area_frac bonus).
+#: border_frac is how far in from each frame edge a semi-transparent overlay is
+#: still searched for; later attempts search deeper into the frame, accept
+#: smaller marks and larger credit blocks.
+WM_AREA_RETRIES = [
+    (0.32, 1.0, 0.00),
+    (0.45, 0.5, 0.10),
+    (0.60, 0.25, 0.20),
 ]
 
 
@@ -1736,32 +1863,42 @@ def detect_watermark_auto(path: str, start_sec: float, end_sec: float, sample_co
     if usable <= 0:
         return []
     nseg = int(np.clip(usable // 12, 1, 4))
-    windows = [(start_sec, end_sec, max(sample_count, 40))]
-    if nseg > 1:
-        seg_len = usable / nseg
+    # Decode the frames ONCE (seeking is the slow part on long files) and let the
+    # whole-window pass and every segment pass share them.
+    _FRAME_CACHE.clear()
+    base = _read_gray_frames(path, start_sec, end_sec, max(sample_count, 40) + (16 if nseg > 1 else 0))
+    all_f = base[0]
+    windows = [(start_sec, end_sec, len(all_f), base)]
+    if nseg > 1 and len(all_f) >= nseg * 6:
+        n = len(all_f)
         for i in range(nseg):
-            windows.append((start_sec + i * seg_len, start_sec + (i + 1) * seg_len, 28))
+            a, b = i * n // nseg, (i + 1) * n // nseg
+            windows.append((start_sec + i * usable / nseg, start_sec + (i + 1) * usable / nseg, b - a,
+                            (all_f[a:b], base[1], base[2], base[3])))
 
-    for rung, (pk, tlo, dens, ring) in enumerate(WM_LADDER):
-        found: List[WatermarkBox] = []
-        for (ws, we, cnt) in windows:
-            try:
-                found += _detect_wm_pass(path, ws, we, sample_count=cnt, min_area_frac=min_area_frac,
-                                         max_area_frac=max_area_frac, density_floor=min(density_floor, dens),
-                                         max_regions=max_regions, border_frac=border_frac, debug=debug,
-                                         peak_floor=pk, thresh_lo=tlo, min_ring_ratio=ring)
-            except Exception as e:   # noqa: BLE001 - one bad window must not lose the others
-                if debug:
-                    print(f"  [watermark-detect] window [{ws:.1f},{we:.1f}] failed: {e}")
-        if found:
-            if debug:
-                print(f"  [watermark-detect] ladder rung {rung + 1}/{len(WM_LADDER)} produced "
-                      f"{len(found)} raw region(s) across {len(windows)} window(s)")
-            return _merge_window_boxes(found, max_regions)
+    for attempt, (bfrac, min_mult, max_bonus) in enumerate(WM_AREA_RETRIES, 1):
+        use_border = max(border_frac, bfrac)
+        for rung, (pk, tlo, dens, ring) in enumerate(WM_LADDER):
+            found: List[WatermarkBox] = []
+            for (ws, we, cnt, pre) in windows:
+                try:
+                    found += _detect_wm_pass(path, ws, we, sample_count=cnt, preloaded=pre,
+                                             min_area_frac=min_area_frac * min_mult,
+                                             max_area_frac=min(0.7, max_area_frac + max_bonus),
+                                             density_floor=min(density_floor, dens),
+                                             max_regions=max_regions, border_frac=use_border, debug=debug,
+                                             peak_floor=pk, thresh_lo=tlo, min_ring_ratio=ring)
+                except Exception as e:   # noqa: BLE001 - one bad window must not lose the others
+                    if debug:
+                        print(f"  [watermark-detect] window [{ws:.1f},{we:.1f}] failed: {e}")
+            if found:
+                if attempt > 1 or rung > 0:
+                    print(f"  watermark found on retry: search attempt {attempt}/{len(WM_AREA_RETRIES)} "
+                          f"(border {use_border:.2f}), sensitivity rung {rung + 1}/{len(WM_LADDER)}")
+                return _merge_window_boxes(found, max_regions)
         if debug:
-            print(f"  [watermark-detect] ladder rung {rung + 1}/{len(WM_LADDER)} found nothing -- "
-                  f"trying a more sensitive rung" if rung + 1 < len(WM_LADDER) else
-                  "  [watermark-detect] lenient rung found nothing -- no watermark detected")
+            print(f"  [watermark-detect] area attempt {attempt}/{len(WM_AREA_RETRIES)} found nothing -- "
+                  f"widening the search area")
     return []
 
 
@@ -1935,7 +2072,7 @@ def _removal_pad(wm: "WatermarkBox") -> Tuple[int, int]:
     made a long thin credit line balloon vertically into a huge box that then
     failed the area cap -- which is why wide text credits were removed on some
     videos and silently skipped on others."""
-    return max(4, int(round(0.05 * wm.w))), max(4, int(round(0.15 * wm.h)))
+    return max(6, int(round(0.08 * wm.w))), max(6, int(round(0.25 * wm.h)))
 
 
 def _padded(wm: "WatermarkBox", frame_w: int, frame_h: int, grow: float = 1.0) -> "WatermarkBox":
@@ -2307,7 +2444,7 @@ def process_single(path: str, out_path_template: str, clip_sec: float, watermark
         elif shared_intro_end is not None:
             intro = BoundaryResult(shared_intro_end, "batch_common_prefix", "high")
         else:
-            intro = detect_intro_single(path, max_search_sec=intro_max_search, debug=debug_detect)
+            intro = detect_intro_with_retries(path, max_search_sec=intro_max_search, debug=debug_detect)
     except Exception as e:   # noqa: BLE001
         _warn(f"intro detection crashed ({str(e).strip()[-120:]}); assuming no intro")
         intro = BoundaryResult(0.0, "detect_error", "none")
@@ -2324,8 +2461,8 @@ def process_single(path: str, out_path_template: str, clip_sec: float, watermark
             outro_start = duration - shared_outro_len
             outro_method, outro_conf = "batch_common_suffix", "high"
         else:
-            outro = detect_outro_single(path, max_search_sec=outro_max_search,
-                                         safety_margin=outro_safety_margin, debug=debug_detect)
+            outro = detect_outro_with_retries(path, max_search_sec=outro_max_search,
+                                               safety_margin=outro_safety_margin, debug=debug_detect)
             outro_start, outro_method, outro_conf = outro.time_sec, outro.method, outro.confidence
     except Exception as e:   # noqa: BLE001
         _warn(f"outro detection crashed ({str(e).strip()[-120:]}); assuming no outro")
@@ -2439,10 +2576,44 @@ def process_single(path: str, out_path_template: str, clip_sec: float, watermark
                 frame_w=frame_w, frame_h=frame_h, crf=crf, optimize=optimize, max_dim=max_dim,
                 video_bitrate=video_bitrate, audio_bitrate=audio_bitrate, encode_preset=encode_preset,
                 notes=list(CURRENT_NOTES), dry_run=dry_run, duration=duration,
-                usable=(usable_start, usable_end))
+                usable=(usable_start, usable_end),
+                intro_info=dict(end=round(intro.time_sec, 2), method=intro.method, confidence=intro.confidence),
+                outro_info=dict(start=round(outro_start, 2), method=outro_method, confidence=outro_conf),
+                verify_intro=(intro.method != "manual_override"),
+                verify_outro=(outro_method != "manual_override"))
     if plan_only:
         return plan
     return execute_plan(plan)
+
+
+def _leftover_boundaries(out_path: str, check_intro: bool, check_outro: bool) -> Tuple[float, float]:
+    """Re-runs intro/outro detection on a RENDERED part and returns
+    (leading_seconds, trailing_seconds) of intro/outro that survived the first
+    cut. Only 'high' confidence hits count, so normal content cuts are ignored."""
+    dur = ffprobe_duration(out_path)
+    lead = tail = 0.0
+    if dur < 6.0:
+        return 0.0, 0.0
+    if check_intro:
+        try:
+            r = detect_intro_single(out_path, max_search_sec=min(10.0, dur * 0.4))
+            if (r.confidence == "high" and not r.method.startswith("static_card")
+                    and 0.5 <= r.time_sec <= min(12.0, dur * 0.4)):
+                lead = r.time_sec
+        except Exception:   # noqa: BLE001
+            pass
+    if check_outro:
+        try:
+            r = detect_outro_single(out_path, max_search_sec=min(10.0, dur * 0.4), safety_margin=0.5)
+            # static-card hits are ignored here: slow-moving real footage at the very end
+            # looks "static" in a short window, and trimming good content is worse than a
+            # leftover frame or two. Black gaps, solid-colour end cards and fades still count.
+            if (r.confidence == "high" and not r.method.startswith(("static_card", "scene_cut"))
+                    and 0.8 <= (dur - r.time_sec) <= min(12.0, dur * 0.4)):
+                tail = dur - r.time_sec
+        except Exception:   # noqa: BLE001
+            pass
+    return lead, tail
 
 
 def execute_plan(plan: dict) -> int:
@@ -2454,10 +2625,16 @@ def execute_plan(plan: dict) -> int:
     path, parts, wms = plan["path"], plan["parts"], plan["wms"]
     out_path_template = plan["out_path_template"]
     entry = dict(name=os.path.basename(path), parts_planned=len(parts), written=0,
-                 wm_source=plan["wm_source"], wm_regions=len(wms), notes=CURRENT_NOTES)
+                 wm_source=plan["wm_source"], wm_regions=len(wms), notes=CURRENT_NOTES,
+                 wm_boxes=[dict(x=w.x, y=w.y, w=w.w, h=w.h, conf=w.conf) for w in wms],
+                 intro=plan.get("intro_info"), outro=plan.get("outro_info"),
+                 outputs=[], wm_unresolved=False, wm_not_found=False, retry_renders=0)
+    retry_budget = [MAX_RETRY_RENDERS]   # per-video cap on extra renders (CI time safety)
 
     def _finish(n: int) -> int:
         entry["written"] = n
+        if plan["wm_source"] == "auto_detect" and not wms:
+            entry["wm_not_found"] = True   # may simply be a clean video
         entry["notes"] = list(CURRENT_NOTES)
         REPORT.append(entry)
         return n
@@ -2489,9 +2666,11 @@ def execute_plan(plan: dict) -> int:
             applied = render_clip(path, out_path, pstart, pdur, wms, **kw)
             if wms and applied:
                 resid = max(_residual_static_fraction(out_path, w, plan["frame_w"], plan["frame_h"]) for w in wms)
-                for grow in (1.35, 1.8):
-                    if resid < RESIDUAL_LIMIT:
+                for grow in (1.35, 1.8, 2.4):
+                    if resid < RESIDUAL_LIMIT or retry_budget[0] <= 0:
                         break
+                    retry_budget[0] -= 1
+                    entry["retry_renders"] += 1
                     tmp = out_path + ".retry.mp4"
                     try:
                         render_clip(path, tmp, pstart, pdur, wms, grow=grow, **kw)
@@ -2510,12 +2689,32 @@ def execute_plan(plan: dict) -> int:
                     else:
                         os.remove(tmp)
                 if resid >= RESIDUAL_LIMIT:
+                    entry["wm_unresolved"] = True
                     _warn(f"part {i:02d}: watermark may still be partly visible (residual {resid:.3f}). "
                           f"Check with --debug-preview or give --watermark-box-pct.")
+            # Post-render boundary check: a leftover intro (first part) or outro
+            # (last part) means detection under-cut; re-render with the extra trimmed.
+            chk_in = plan.get("verify_intro", False) and i == 1
+            chk_out = plan.get("verify_outro", False) and i == len(parts)
+            if chk_in or chk_out:
+                lead, tail = _leftover_boundaries(out_path, chk_in, chk_out)
+                if (lead or tail) and pdur - lead - tail >= 2.0 and retry_budget[0] > 0:
+                    retry_budget[0] -= 1
+                    entry["retry_renders"] += 1
+                    tmp = out_path + ".trim.mp4"
+                    try:
+                        render_clip(path, tmp, pstart + lead, pdur - lead - tail, wms, **kw)
+                        os.replace(tmp, out_path)
+                        _warn(f"part {i:02d}: leftover intro/outro found after first cut -- "
+                              f"trimmed another {lead:.2f}s from the start and {tail:.2f}s from the end.")
+                    except Exception:   # noqa: BLE001
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
         except Exception as e:   # noqa: BLE001 - keep the other parts of this video
             _warn(f"part {i:02d} failed and was skipped: {str(e).strip()[-400:]}")
             continue
         written += 1
+        entry["outputs"].append(os.path.basename(out_path))
         print(f"  -> wrote {out_path}")
     return _finish(written)
 
@@ -2523,6 +2722,22 @@ def execute_plan(plan: dict) -> int:
 #: A rendered part whose watermark box still has more than this fraction of
 #: persistent-edge pixels is considered "not cleanly removed".
 RESIDUAL_LIMIT = 0.05
+
+#: Max extra re-renders (bigger box / extra trim) per VIDEO. Each costs a full encode, so
+#: this keeps CI run time predictable. Override with --max-retry-renders.
+MAX_RETRY_RENDERS = 4
+
+
+def write_report_json(path: Optional[str]) -> None:
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(REPORT, f, indent=2, default=str)
+        print(f"Report JSON written to {path}")
+    except OSError as e:
+        print(f"  !! could not write report JSON: {e}")
 
 
 def print_report() -> None:
@@ -2633,6 +2848,17 @@ def main():
                      help="Save a PNG per video with a red box around whatever region will actually "
                           "be delogo'd (detected or manual), so you can check alignment before "
                           "rendering the whole batch.")
+    ap.add_argument("--report-json", default=os.environ.get("EDITOR_REPORT_JSON"),
+                    help="Write a machine-readable per-video report (parts, watermark boxes, notes, "
+                         "unresolved flags) to this path. Used by the CI pipeline.")
+    ap.add_argument("--time-budget-min", type=float,
+                    default=float(os.environ.get("EDITOR_TIME_BUDGET_MIN") or 0),
+                    help="Batch mode soft limit in minutes (0 = none). Once exceeded, no NEW video is "
+                         "started; the rest are reported as 'deferred' (the CI pipeline retries them "
+                         "next run) so the job finishes and uploads what is done instead of timing out.")
+    ap.add_argument("--max-retry-renders", type=int, default=MAX_RETRY_RENDERS,
+                    help="Max extra re-renders per video (bigger delogo box / extra intro-outro trim). "
+                         "Each is a full encode; lower this to save CI time. 0 disables.")
     ap.add_argument("--debug-detect", action="store_true",
                      help="Print per-candidate scoring during auto watermark AND intro/outro detection.")
     ap.add_argument("--intro-sec", type=float, default=None,
@@ -2644,6 +2870,7 @@ def main():
                      help="Disable outro detection entirely (only intro is removed).")
     ap.add_argument("--dry-run", action="store_true", help="Only print detections, do not render.")
     args = ap.parse_args()
+    globals()["MAX_RETRY_RENDERS"] = max(0, args.max_retry_renders)
 
     if args.mode == "single":
         if not args.input:
@@ -2669,6 +2896,7 @@ def main():
                         wm_total_frac=args.watermark_total_area_pct / 100.0,
                         wm_edge_only=args.wm_edge_only)
         print_report()
+        write_report_json(args.report_json)
 
     else:  # batch
         if not args.batch:
@@ -2758,7 +2986,18 @@ def main():
         # PHASE 1: plan every video (intro/outro/watermark/parts), nothing rendered yet.
         plans = []
         n_failed = 0
+        t_start = time.time()
+        budget_s = args.time_budget_min * 60.0 if args.time_budget_min and args.time_budget_min > 0 else 0.0
+
+        def _defer(p_, why):
+            REPORT.append(dict(name=os.path.basename(p_), parts_planned=0, written=0, wm_source="n/a",
+                               wm_regions=0, deferred=True, outputs=[], notes=[why]))
+
         for p in paths:
+            if budget_s and time.time() - t_start > budget_s:
+                _defer(p, "deferred: editor time budget reached before this video was analysed (retry next run)")
+                n_failed += 1
+                continue
             try:
                 plan = process_single(p, _out_template(p), args.clip_seconds, args.watermark,
                                 args.dry_run, args.single_clip, args.keep_remainder,
@@ -2826,6 +3065,10 @@ def main():
         # PHASE 2: render.
         n_ok = 0
         for pl in plans:
+            if budget_s and time.time() - t_start > budget_s:
+                _defer(pl["path"], "deferred: editor time budget reached before this video was rendered (retry next run)")
+                n_failed += 1
+                continue
             try:
                 written = execute_plan(pl)
                 if written or args.dry_run:
@@ -2842,6 +3085,7 @@ def main():
 
         print(f"\nBatch summary: {n_ok} video(s) produced output, {n_failed} produced none.")
         print_report()
+        write_report_json(args.report_json)
         if n_ok == 0 and n_failed > 0 and not args.dry_run:
             sys.exit(1)
 
