@@ -66,6 +66,7 @@ DEDUP_LOCAL_PATH = Path(DEDUP_FILENAME)
 STRIP_PHRASES_FILENAME = "strip_phrases.txt"
 STRIP_PHRASES_LOCAL_PATH = Path(STRIP_PHRASES_FILENAME)
 EDITOR_SCRIPT = Path("video_auto_editor.py")
+EDITOR_REPORT_PATH = Path("edit_report") / "edit_report.json"
 DEFAULT_SPREADSHEET_ID = "15_9D1UMPIYkq3vgeLxf4WdIxIrl_S_Oo_BmkIOpr7ng"
 SHEET_HEADER = ["File Name", "Caption"]
 
@@ -233,6 +234,19 @@ def parse_args():
         type=int,
         default=(int(os.environ["CRF"]) if os.environ.get("CRF") else None),
         help="x264 quality for the output (editor default 20; lower = sharper/bigger).",
+    )
+    p.add_argument(
+        "--editor-time-budget-min",
+        type=float,
+        default=float(os.environ.get("EDITOR_TIME_BUDGET_MIN") or 240),
+        help="Soft time limit for the editing step (minutes, 0 = none). Videos not started in time are "
+             "left for the next run instead of the whole job timing out and uploading nothing.",
+    )
+    p.add_argument(
+        "--max-retry-renders",
+        type=int,
+        default=int(os.environ.get("MAX_RETRY_RENDERS") or 4),
+        help="Max extra re-renders per video inside the editor (bigger watermark box / extra intro-outro trim).",
     )
     p.add_argument(
         "--upload-originals-on-failure",
@@ -982,11 +996,17 @@ def _download_one(src: str, caption: str, headers: dict, used_names: set,
         # clean query-string junk
         name = name.split("?")[0]
 
+    # The editor names outputs <stem>.mp4 / <stem>_partNN.mp4 and this script maps them
+    # back to captions by STEM, so stems must be unique (a.mp4 + a.webm used to clash)
+    # and must not look like a part suffix themselves.
     with names_lock:
-        if name in used_names:
-            stem, ext = os.path.splitext(name)
-            name = f"{stem}_{hashlib.sha1(src.encode()).hexdigest()[:6]}{ext}"
-        used_names.add(name)
+        stem, ext = os.path.splitext(name)
+        if re.search(r"_part\d+$", stem, re.IGNORECASE):
+            stem += "_v"
+        if stem.lower() in used_names:
+            stem = f"{stem}_{hashlib.sha1(src.encode()).hexdigest()[:6]}"
+        used_names.add(stem.lower())
+        name = stem + ext
     dest = DOWNLOAD_DIR / name
 
     last_err = None
@@ -1197,20 +1217,29 @@ def rclone_upload_all(source_dir: Path, remote_target: str, config_path: str,
 # ---------------------------------------------------------------------------
 def run_video_editor(clip_seconds: float, extra_args: str = "", watermark: str = "auto",
                      max_dim: int | None = None, crf: int | None = None,
-                     shared_watermark: bool = False) -> bool:
+                     shared_watermark: bool = False, time_budget_min: float = 0,
+                     max_retry_renders: int | None = None) -> bool:
     """
     Run video_auto_editor.py in batch mode on DOWNLOAD_DIR → EDITED_DIR.
 
-    shared_watermark=False (default): the watermark is detected PER VIDEO.
-    The old behavior (detect once on the alphabetically-first video and stamp
-    that box on every other video) put a blurry delogo patch in the middle of
-    real picture whenever videos had different layouts.
+    Everything adaptive lives inside the editor and is on by default: per-video
+    watermark/logo/credit detection with sensitivity + search-area retries, intro/outro
+    detection with retries, a post-render check that re-trims leftover intros/outros and
+    re-renders with a bigger delogo box if the overlay is still visible, and a per-video
+    cap on those extra renders. It also writes EDITOR_REPORT_PATH (JSON) for the run summary.
+
+    shared_watermark=False (default): the watermark is detected PER VIDEO. (The editor
+    still falls back to a position shared by the rest of the batch, but only after
+    verifying it in that video's own pixels.)
     """
     if not EDITOR_SCRIPT.exists():
         log(f"ERROR: {EDITOR_SCRIPT} not found in the working directory.")
         return False
 
     EDITED_DIR.mkdir(parents=True, exist_ok=True)
+    EDITOR_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if EDITOR_REPORT_PATH.exists():
+        EDITOR_REPORT_PATH.unlink()
 
     cmd = [
         sys.executable, "-u", str(EDITOR_SCRIPT),
@@ -1219,6 +1248,7 @@ def run_video_editor(clip_seconds: float, extra_args: str = "", watermark: str =
         "--outdir", str(EDITED_DIR),
         "--clip-seconds", str(clip_seconds),
         "--watermark", watermark,
+        "--report-json", str(EDITOR_REPORT_PATH),
     ]
     if watermark == "auto" and shared_watermark:
         cmd.append("--shared-watermark-from-first")
@@ -1226,6 +1256,10 @@ def run_video_editor(clip_seconds: float, extra_args: str = "", watermark: str =
         cmd += ["--max-dim", str(max_dim)]
     if crf:
         cmd += ["--crf", str(crf)]
+    if time_budget_min and time_budget_min > 0:
+        cmd += ["--time-budget-min", str(time_budget_min)]
+    if max_retry_renders is not None:
+        cmd += ["--max-retry-renders", str(max_retry_renders)]
     if extra_args.strip():
         # shlex so quoted values survive; later flags override earlier ones
         cmd.extend(shlex.split(extra_args))
@@ -1240,18 +1274,62 @@ def run_video_editor(clip_seconds: float, extra_args: str = "", watermark: str =
     return True
 
 
+def load_editor_report() -> list:
+    try:
+        return json.loads(EDITOR_REPORT_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
+def write_run_summary(report: list, uploaded_clips: int) -> None:
+    """Human-readable result in the GitHub Actions job summary + ::warning:: lines for
+    anything the editor could not fully handle."""
+    if not report:
+        return
+    lines = ["## Video edit report", "",
+             f"**{uploaded_clips}** short clip(s) uploaded.", "",
+             "| Video | Clips | Intro cut | Outro cut | Watermark | Notes |",
+             "|---|---|---|---|---|---|"]
+    for e in report:
+        name = e.get("name", "?")
+        intro = (e.get("intro") or {})
+        outro = (e.get("outro") or {})
+        wm = (f"{e.get('wm_regions', 0)} region(s) via {e.get('wm_source', '?')}"
+              if e.get("wm_regions") else ("not found" if e.get("wm_not_found") else "none"))
+        if e.get("wm_unresolved"):
+            wm += " ⚠️ may still be visible"
+        notes = "; ".join(str(n).replace("|", "/") for n in (e.get("notes") or []))[:300]
+        lines.append(f"| {name} | {e.get('written', 0)}/{e.get('parts_planned', 0)} | "
+                     f"{intro.get('end', '-')}s ({intro.get('method', '-')}) | "
+                     f"{outro.get('start', '-')}s ({outro.get('method', '-')}) | {wm} | {notes} |")
+        if e.get("deferred"):
+            print(f"::warning::{name}: deferred (editor time budget) - will be retried next run")
+        elif e.get("written", 0) == 0:
+            print(f"::warning::{name}: no clips produced - will be retried next run")
+        elif e.get("wm_unresolved"):
+            print(f"::warning::{name}: watermark/credit may still be partly visible after all retries")
+        elif e.get("wm_not_found"):
+            print(f"::notice::{name}: no watermark/logo/credit detected (clean video, or too faint)")
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        try:
+            with open(summary, "a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except OSError:
+            pass
+
+
+def _out_base_stem(path: Path) -> str:
+    m = re.match(r"^(.+)_part\d+$", path.stem, re.IGNORECASE)
+    return (m.group(1) if m else path.stem).lower()
+
+
 def originals_without_output(saved: list, mapped: list) -> list:
-    """(dest, src) for every downloaded original that produced NO edited clip."""
-    out_stems = set()
-    for path, _cap in mapped:
-        m = re.match(r"^(.+)_part\d+$", path.stem, re.IGNORECASE)
-        out_stems.add(m.group(1) if m else path.stem)
-    missing = []
-    for dest, src, _cap in saved:
-        st = dest.stem
-        if not any(o == st or o.startswith(st) or st.startswith(o) for o in out_stems):
-            missing.append((dest, src))
-    return missing
+    """(dest, src) for every downloaded original that produced NO edited clip.
+    Exact stem match (download stems are unique and the editor keeps them) -- the old
+    prefix matching treated 'video1' as done whenever 'video10' had output."""
+    out_stems = {_out_base_stem(path) for path, _cap in mapped}
+    return [(dest, src) for dest, src, _cap in saved if dest.stem.lower() not in out_stems]
 
 
 def map_edited_files_to_captions(saved: list) -> list:
@@ -1264,12 +1342,10 @@ def map_edited_files_to_captions(saved: list) -> list:
       - multi parts  →  <stem>_part01.mp4, <stem>_part02.mp4, ...
 
     Returns list of (Path, caption) for every file in EDITED_DIR that we can
-    match to an original download.
+    match to an original download. Exact (case-insensitive) stem match first; a
+    longest-prefix match is only a fallback for renamed outputs.
     """
-    # original stem → caption
-    stem_to_caption = {}
-    for dest, _src, caption in saved:
-        stem_to_caption[dest.stem] = caption
+    stem_to_caption = {dest.stem.lower(): caption for dest, _src, caption in saved}
 
     results = []
     if not EDITED_DIR.exists():
@@ -1280,18 +1356,12 @@ def map_edited_files_to_captions(saved: list) -> list:
             continue
         if path.suffix.lower() not in (".mp4", ".mov", ".mkv", ".webm", ".avi"):
             continue
-        # strip _partNN suffix if present
-        stem = path.stem
-        m = re.match(r"^(.+)_part\d+$", stem, re.IGNORECASE)
-        base_stem = m.group(1) if m else stem
-
-        caption = stem_to_caption.get(base_stem, "")
-        if not caption:
-            # try a looser match (editor sometimes sanitizes names)
-            for orig_stem, cap in stem_to_caption.items():
-                if base_stem.startswith(orig_stem) or orig_stem.startswith(base_stem):
-                    caption = cap
-                    break
+        base_stem = _out_base_stem(path)
+        caption = stem_to_caption.get(base_stem)
+        if caption is None:
+            cands = [(len(o), cap) for o, cap in stem_to_caption.items()
+                     if base_stem.startswith(o) or o.startswith(base_stem)]
+            caption = max(cands)[1] if cands else ""
         results.append((path, caption))
         log(f"  mapped {path.name} ← caption={caption[:60]!r}...")
     return results
@@ -1399,6 +1469,8 @@ def main():
     log(f"Download concurrency: {args.download_concurrency}")
     log(f"Upload transfers: {args.upload_transfers}")
     log(f"Editor clip-seconds: {args.clip_seconds}")
+    log(f"Editor time budget: {args.editor_time_budget_min or 'none'} min; "
+        f"max retry renders/video: {args.max_retry_renders}")
     log(f"Skip edit: {args.skip_edit}")
     log(f"Watermark mode: {args.watermark_mode} (shared across batch: {args.shared_watermark}); "
         f"max-dim: {args.max_dim or 'editor default (1920)'}; crf: {args.crf or 'editor default (20)'}")
@@ -1493,7 +1565,9 @@ def main():
     if not args.skip_edit:
         ok = run_video_editor(args.clip_seconds, extra_args=args.editor_extra_args,
                               watermark=args.watermark_mode, max_dim=args.max_dim,
-                              crf=args.crf, shared_watermark=args.shared_watermark)
+                              crf=args.crf, shared_watermark=args.shared_watermark,
+                              time_budget_min=args.editor_time_budget_min,
+                              max_retry_renders=args.max_retry_renders)
         mapped = map_edited_files_to_captions(saved)
         if mapped:
             upload_dir = EDITED_DIR
@@ -1519,6 +1593,9 @@ def main():
         log("SKIP_EDIT set — uploading raw downloads without intro/outro/watermark processing.")
         upload_dir = DOWNLOAD_DIR
         sheet_items = [(dest, caption) for dest, _src, caption in saved]
+
+    if not args.skip_edit:
+        write_run_summary(load_editor_report(), len(sheet_items))
 
     # 6. Upload ONLY the short clips
     if upload_dir is not None:
