@@ -79,6 +79,28 @@ on:
         required: false
         default: ""
         type: string
+      watermark_mode:
+        description: |
+          auto = detect + remove logos / watermarks / credit text per video (with automatic retries)
+          none = never touch the picture
+        required: false
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - none
+      editor_time_budget_min:
+        description: |
+          Soft time limit (minutes) for the editing step. Videos not started in time are left for the
+          next run (not lost) so the job always finishes and uploads what is done. 0 = no limit.
+        required: false
+        default: "240"
+        type: string
+      max_retry_renders:
+        description: "Max extra re-renders per video (bigger watermark box / extra intro-outro trim). 0 = off"
+        required: false
+        default: "4"
+        type: string
       skip_edit:
         description: "Set to 'true' to skip video_auto_editor and upload raw downloads (debug only)"
         required: false
@@ -115,7 +137,8 @@ jobs:
 
       - name: Install Python dependencies (video_auto_editor)
         run: |
-          pip install opencv-python numpy imagehash pillow
+          # headless OpenCV: no libGL needed on the runner
+          pip install opencv-python-headless numpy imagehash pillow
           python - <<'PY'
           import numpy, cv2, imagehash
           from PIL import Image
@@ -125,6 +148,8 @@ jobs:
           print("Pillow", Image.__version__)
           print("All editor imports OK")
           PY
+          python -m py_compile video_auto_editor.py sitesdo_videos.py
+          python video_auto_editor.py --help > /dev/null && echo "editor CLI OK"
 
       - name: Install Playwright browsers
         run: playwright install --with-deps chromium
@@ -159,6 +184,9 @@ jobs:
           DOWNLOAD_CONCURRENCY: ${{ inputs.download_concurrency }}
           UPLOAD_TRANSFERS: ${{ inputs.upload_transfers }}
           EDITOR_EXTRA_ARGS: ${{ inputs.editor_extra_args }}
+          WATERMARK_MODE: ${{ inputs.watermark_mode }}
+          EDITOR_TIME_BUDGET_MIN: ${{ inputs.editor_time_budget_min }}
+          MAX_RETRY_RENDERS: ${{ inputs.max_retry_renders }}
           SKIP_EDIT: ${{ inputs.skip_edit }}
           RCLONE_CONFIG_PATH: rclone.conf
           RCLONE_REMOTE_NAME: mega
@@ -178,4 +206,5 @@ jobs:
           path: |
             downloaded_videos/
             edited_videos/
+            edit_report/
           if-no-files-found: ignore
