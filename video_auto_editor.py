@@ -2210,6 +2210,10 @@ def main():
     ap.add_argument("--outro-sec", type=float, default=None)
     ap.add_argument("--no-outro-detect", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
+    if len(sys.argv) == 1 and os.path.basename(sys.argv[0]) != "video_auto_editor.py":
+        sys.exit(f"ERROR: this file ({os.path.basename(sys.argv[0])}) contains the VIDEO EDITOR code, not the "
+                 f"scraper. Put video_auto_editor.py in video_auto_editor.py and the scraper/uploader "
+                 f"script in sitesdo_videos.py.")
     args = ap.parse_args()
     if args.mode is None:
         args.mode = "batch" if (args.batch and not args.input) else "single"
